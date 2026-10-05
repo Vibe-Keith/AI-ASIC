@@ -101,3 +101,17 @@ hasher-host
 cli
 /pipeline/AlpacaDataCleaned-main
 pipeline/AlpacaDataCleaned-main.zip
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/

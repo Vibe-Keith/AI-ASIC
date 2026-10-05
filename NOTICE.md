@@ -5,23 +5,22 @@ This project (AI-ASIC) is a derivative work of **HASHER** by guiperry:
 - Upstream: https://github.com/guiperry/HASHER
 - License: GNU General Public License v3.0 (GPL-3.0)
 
-The original HASHER source is incorporated here under the terms of the GPL-3.0, which is
-retained in [`LICENSE`](LICENSE). As a derivative work, this repository is also
-distributed under the GPL-3.0.
+The original HASHER source was written in Go. This repository is a **Python port** of its
+portable core, distributed under the same GPL-3.0 license (retained in [`LICENSE`](LICENSE)).
 
-## Modifications in this fork
+## Changes in this project
 
-Support for newer Bitmain ASIC miners beyond the original Antminer S2/S3 (BM1382) target:
+1. **Python port (cross-platform, Windows-compatible).** The Go sources were replaced with a
+   pure-Python package (`ai_asic/`) that depends only on the Python standard library at
+   runtime. See the "What was ported" table in [`README.md`](README.md) for the per-component
+   mapping and for the Linux/hardware-only subsystems (eBPF, CUDA, MIPS on-device server, USB
+   kernel driver, gRPC server, TUI, spaCy pipeline) that were intentionally not ported
+   because they cannot run on Windows.
 
-- `pkg/hashing/hardware/miner_profiles.go` - miner profile registry (S1 through S21) and
-  model auto-detection via `ASIC_MODEL` / the cgminer-bmminer JSON-RPC API.
-- `pkg/hashing/hardware/bm1387_header.go` - BM1387 (Antminer S9 family / T9+) work
-  encoder: SHA-256 midstate computation, 12-byte work tail, CRC5/CRC16, chain command
-  framing, AsicBoost version rolling, and nonce-response parsing.
-- `pkg/hashing/hardware/device_detector.go` - model-aware ASIC detection that reports
-  capabilities from the detected miner profile rather than a hard-coded Antminer S3.
-- Tests: `pkg/hashing/hardware/miner_profiles_test.go`,
-  `pkg/hashing/hardware/bm1387_header_test.go`.
-- Documentation: `docs/NEWER_MINERS.md`.
+2. **Newer ASIC miner support.** Added a miner profile registry (Antminer S1 through S21),
+   model auto-detection via `ASIC_MODEL` or the cgminer/bmminer JSON-RPC API, and a BM1387
+   (Antminer S9 family / T9+) work encoder (SHA-256 midstate, 12-byte tail, CRC5/CRC16,
+   chain command framing, AsicBoost version rolling, nonce-response parsing).
 
-The Go module path remains `hasher` for upstream source compatibility.
+The original Go implementation remains available in this repository's git history and from
+the upstream project.

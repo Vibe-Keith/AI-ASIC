@@ -1,0 +1,4 @@
+# AI-ASIC core engine uses only the Python standard library (no runtime deps),
+# so it runs on a clean Windows/macOS/Linux Python 3.8+ install.
+# Development / testing:
+pytest>=7.0

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-asic"
+version = "0.1.0"
+description = "SHA-256 hash neural-network inference on repurposed Bitcoin mining hardware (Antminer S2/S3 through S9 and newer)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Keith Hinrichs" }]
+keywords = ["asic", "antminer", "s9", "bm1387", "sha256", "neural-network", "mining"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
+# Core engine has zero third-party runtime dependencies (stdlib only) for maximum
+# portability on Windows. Optional extras add speed/dev tooling.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+ai-asic = "ai_asic.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ai_asic*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
