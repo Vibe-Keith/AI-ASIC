@@ -64,6 +64,23 @@ python -m ai_asic.cli encode-work --work-id 42
 
 On Windows you can also use the launchers: `run.bat detect` or `.\run.ps1 detect`.
 
+## Graphical interface
+
+A Tkinter GUI ties every capability above (detect, profiles, infer, encode-work)
+into one window. Tkinter ships with the standard library, so there is nothing
+extra to install on a normal Windows/macOS Python build.
+
+```bash
+python -m ai_asic.gui
+```
+
+On Windows use `run-gui.bat` or `.\run-gui.ps1`. Long-running detection and
+inference run on background threads, so the window stays responsive; switch the
+Infer tab's "Use cgminer ASIC backend" checkbox on to target a real miner.
+
+(On a minimal Linux install Tkinter may be a separate package, e.g.
+`sudo apt install python3-tk`.)
+
 ## Library usage
 
 ```python

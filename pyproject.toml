@@ -28,6 +28,9 @@ dev = ["pytest>=7.0"]
 [project.scripts]
 ai-asic = "ai_asic.cli:main"
 
+[project.gui-scripts]
+ai-asic-gui = "ai_asic.gui:main"
+
 [tool.setuptools.packages.find]
 include = ["ai_asic*"]
 
