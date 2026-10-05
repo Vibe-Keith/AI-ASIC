@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  hasher-host:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hasher-host
+    privileged: true  # May be needed for some device operations
+    ports:
+      - "8080:8080"
+    devices:
+      - /dev/bitmain-asic:/dev/bitmain-asic  # Mount ASIC device (if available)
+    environment:
+      - HOST_PORT=8080
+      - HOST_TRACE_ENABLED=true
+    command: ["hasher-host", "--port=8080"]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hasher-host-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hasher-host-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./deploy/grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+volumes:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  default:
+    name: hasher-host-network
