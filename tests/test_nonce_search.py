@@ -90,3 +90,50 @@ def test_llama_kwargs():
             pass
 
     assert set(llama_kwargs({**DEFAULT_CONFIG, "n_threads": 4}, Old)) == {"n_ctx", "n_threads"}
+
+
+def test_search_many_matches_individual_searches(monkeypatch):
+    monkeypatch.setattr(nonce_search, "PARALLEL_MIN_WORK", 1 << 10)
+    monkeypatch.setenv("AI_ASIC_WORKERS", "2")
+    jobs = [(hashlib.sha256(bytes([i])).digest() * 2 + bytes(16), 6 + i % 5, 0, 1 << 14)
+            for i in range(12)]
+    assert nonce_search.search_many(jobs) == [nonce_search.search_serial(*j) for j in jobs]
+
+
+def test_virtual_device_mine_batch_matches_mine():
+    from ai_asic.server import VirtualAsicDevice
+
+    dev = VirtualAsicDevice()
+    jobs = [{"header": hashlib.sha256(bytes([i])).digest() * 2 + bytes(16),
+             "difficulty_bits": 8, "max_nonces": 1 << 14} for i in range(6)]
+    jobs.append({"header": HEADER, "difficulty_bits": 40, "max_nonces": 64})  # not found
+    assert dev.mine_batch(jobs) == [dev.mine(j["header"], j["difficulty_bits"],
+                                             max_nonces=j["max_nonces"]) for j in jobs]
+
+
+def test_split_model_batches_the_mining_layer_on_the_asic():
+    from ai_asic.server import HasherServer, VirtualAsicDevice
+    from ai_asic.workloads.split_model import MiningBackend, SplitModel
+
+    model = SplitModel(mining_neurons=4, difficulty_bits=8, nonce_range=1 << 14)
+    host = model.infer(b"optics", MiningBackend(prefer_asic=False, difficulty_bits=8,
+                                                 max_nonces=1 << 14))
+    srv = HasherServer(device=VirtualAsicDevice(), port=0).start()
+    try:
+        be = MiningBackend("127.0.0.1", srv.port, difficulty_bits=8, max_nonces=1 << 14)
+        before = srv.metrics.total_requests
+        asic = model.infer(b"optics", be)
+        assert asic.trace.asic_is_hardware and asic.nonces == host.nonces
+        assert srv.metrics.total_requests - before == 1  # one MineBatch for all 4 headers
+    finally:
+        srv.stop()
+
+
+def test_bucket_table_prefetch_makes_lookups_cache_hits():
+    from ai_asic.chat.accelerator import HashAccelerator
+    from ai_asic.chat.lsh import BucketHasher
+
+    hasher = BucketHasher(HashAccelerator(), difficulty_bits=6, max_nonces=4096)
+    assert hasher.prefetch_table(10, 6) == 640 and len(hasher) == 640
+    _, stats = hasher.buckets([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    assert stats.searches == 0 and stats.cache_hits == 10

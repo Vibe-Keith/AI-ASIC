@@ -190,7 +190,9 @@ classifier whose layers are partitioned across the two devices by what each is g
 | head | **host CPU** | SHA-256 hash layer → class logits → prediction |
 
 The mining layer is the one operation a SHA-256 ASIC natively accelerates (a nonce search),
-so that is the layer offloaded to the chip; the rest stays on the host. Run it:
+so that is the layer offloaded to the chip; the rest stays on the host. All of a layer's headers
+go to the device in one `MineBatch` round trip, and the virtual chip searches them together
+(8 headers at 18 bits: 688 ms one at a time, 169 ms batched on 4 cores). Run it:
 
 ```bash
 # Host only (software nonce search)
@@ -274,7 +276,7 @@ the one operation a BM1387 natively performs: **nonce search** over an 80-byte h
 | Stage | Device | What it does |
 |-------|--------|--------------|
 | fingerprint | host | SHA-256 content address of (model, conversation, sampling) → response cache; an exact repeat is answered without running the LLM |
-| route.buckets | **ASIC** | LSH bucket IDs for the new message (and any history exchange not yet bucketed) by native nonce search: one batched request, mostly cache hits |
+| route.buckets | **ASIC** | LSH bucket IDs for the new message and history exchanges by native nonce search. The whole bucket table (640 headers) is searched on the ASIC in the background at startup, so this is a cache lookup during a reply |
 | route | host | **KV-block routing**: once the prompt outgrows a budget, keep the newest exchanges plus the old ones whose buckets match the new message, so the CPU attends over a shorter context |
 | retrieve | host | past replies to similar prompts (found by bucket) become extra draft candidates |
 | llm | host | llama.cpp prefill, verification passes, sampling - with exact counts of verification passes and attention work |
@@ -285,7 +287,9 @@ the one operation a BM1387 natively performs: **nonce search** over an 80-byte h
 keys, digests) is not something a mining chip can do, so it runs on the host and the trace says
 so; it also costs no network round trip. Nonce searches are asynchronous and batched (one
 `MineBatch` request per group, never one per token), and the accelerator keeps the device path
-warm with a tiny search while idle. Every reply prints the device that ran each stage and the two
+warm with a tiny search while idle. At startup the engine has the ASIC search every LSH bucket
+header (`lsh_prefetch_table`; 3 round trips, 0.3 s on the virtual chip), which took the
+route.buckets stage from 8-13 ms per turn to under 0.1 ms. Every reply prints the device that ran each stage and the two
 numbers that predict real speed on a CPU: **accepted tokens per verification pass** and
 **attention pairs** (query-key work per layer and head, including draft tokens evaluated and not
 kept):

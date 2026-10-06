@@ -12,8 +12,10 @@ similarity information, and a host SHA-256 would serve equally well. It is the s
 chip does genuine, native work for routing and retrieval.
 
 Buckets are cached. There are only ``n_bands * 2**band_bits`` possible headers (640 by
-default), so after warm-up most lookups are cache hits and the chip is asked only for headers it
-has not searched before - in one batched request.
+default), so the chat engine has the chip search the whole table in the background when it
+starts (:meth:`BucketHasher.prefetch_table`, config ``lsh_prefetch_table``); after that no
+reply waits on the device for a bucket. Without the prefetch, the chip is asked only for headers
+it has not searched before - in one batched request per turn.
 
 Determinism on real silicon: the virtual chip and the host fallback both search upward from
 nonce 0, so "first valid nonce" is well defined. A multi-core chip reports whichever core finds
@@ -104,6 +106,7 @@ class BucketStats:
     searches: int = 0      # nonce searches sent to the device this call
     hashes: int = 0        # hashes those searches took
     cache_hits: int = 0
+    waited: int = 0        # already in flight (e.g. the startup table) and waited for
     round_trips: int = 0
     seconds: float = 0.0
     device: str = DEVICE_HOST
@@ -166,6 +169,7 @@ class BucketHasher:
             except Exception:
                 pass
         stats.searches = len(submitted)
+        stats.waited = len(waiting) - len(submitted)
         stats.round_trips = (len(submitted) + 255) // 256 if submitted else 0
         stats.cache_hits = len(set(pairs)) - len(waiting)
         with self._lock:
@@ -176,6 +180,15 @@ class BucketHasher:
     def prefetch(self, band_lists: Sequence[Sequence[int]], stage: str = "route.prefetch") -> int:
         """Start searches for these bands in the background; returns how many were queued."""
         pairs = [(i, v) for bl in band_lists for i, v in enumerate(bl)]
+        return len(self._submit(pairs, stage))
+
+    def prefetch_table(self, n_bands: int, band_bits: int,
+                       stage: str = "lsh.table") -> int:
+        """Queue the whole bucket table - every ``(band index, band value)`` header, 640 by
+        default - as background nonce searches (a few ``MineBatch`` round trips). Afterwards
+        every bucket lookup is a cache hit, so routing and retrieval never wait on the device
+        during a reply. Returns how many searches were queued."""
+        pairs = [(i, v) for i in range(n_bands) for v in range(1 << band_bits)]
         return len(self._submit(pairs, stage))
 
     def cached(self, band_list: Sequence[int]) -> Optional[Buckets]:

@@ -134,23 +134,49 @@ class VirtualAsicDevice(AsicDevice):
         return MineOutcome(r.nonce, r.found, r.hash_hex, r.leading_zeros,
                            r.hashes_tried, r.midstate_index)
 
+    def mine_batch(self, jobs: Sequence[dict]) -> List[MineOutcome]:
+        """A ``MineBatch``: on the fast path the searches run together
+        (:func:`~ai_asic.hashing.nonce_search.search_many`, spread over processes when the batch
+        is large enough), like several chips of a chain working at once. Same results as one
+        :meth:`mine` per job."""
+        if len(jobs) > MAX_BATCH_SIZE:
+            raise ValueError(f"batch exceeds {MAX_BATCH_SIZE}")
+        if not self.fast:
+            return super().mine_batch(jobs)
+        parsed = []
+        for j in jobs:
+            header = bytes(j["header"])
+            if len(header) != 80:
+                raise ValueError("header must be 80 bytes")
+            parsed.append((header, int(j.get("difficulty_bits", 16)),
+                           int(j.get("start", 0)), int(j.get("max_nonces", 1 << 20))))
+        results = nonce_search.search_many(parsed)
+        return [self._outcome(h, s, c, r) for (h, _, s, c), r in zip(parsed, results)]
+
     def _mine_fast(self, header: bytes, difficulty_bits: int, max_nonces: int,
                    start: int) -> MineOutcome:
+        return self._outcome(header, start, max_nonces,
+                             nonce_search.search(header, difficulty_bits, start, max_nonces))
+
+    @staticmethod
+    def _outcome(header: bytes, start: int, max_nonces: int,
+                 result: "nonce_search.SearchResult") -> MineOutcome:
+        """Turn a hashlib search into the chip's answer, re-deriving a winning nonce through the
+        cycle-honest midstate-only model (a mismatch raises)."""
         from ai_asic.hardware.simulator import _finish_double_sha_from_midstate
 
+        nonce, digest, tried = result
+        if nonce is None:
+            end = start + max_nonces
+            return MineOutcome(end & _MASK, False, (b"\x00" * 32).hex(), 0, tried, 0)
         # The chip's view of the work: a CRC-checked frame with the midstate and 12-byte tail.
+        # hashlib resumed from header[:64] has exactly the frame's midstate as its state.
         work = bm1387.decode_work(bm1387.new_work_from_header(header, work_id=1).encode(),
                                   verify_crc=True)
-        tail = bytes(work.data)
-        # hashlib resumed from header[:64] has exactly the frame's midstate as its state.
-        nonce, digest, tried = nonce_search.search(header, difficulty_bits, start, max_nonces)
-        if nonce is not None:
-            if _finish_double_sha_from_midstate(work.midstates[0], tail, nonce) != digest:
-                raise RuntimeError("midstate model disagrees with the nonce search")
-            return MineOutcome(nonce & _MASK, True, digest.hex(),
-                               nonce_search.leading_zero_bits(digest), tried, 0)
-        end = start + max_nonces
-        return MineOutcome(end & _MASK, False, (b"\x00" * 32).hex(), 0, tried, 0)
+        if _finish_double_sha_from_midstate(work.midstates[0], bytes(work.data), nonce) != digest:
+            raise RuntimeError("midstate model disagrees with the nonce search")
+        return MineOutcome(nonce & _MASK, True, digest.hex(),
+                           nonce_search.leading_zero_bits(digest), tried, 0)
 
 
 class ChainAsicDevice(AsicDevice):
@@ -190,15 +216,28 @@ class ChainAsicDevice(AsicDevice):
     def mine(self, header: bytes, difficulty_bits: int, max_nonces: int = 1 << 20,
              start: int = 0) -> MineOutcome:
         self._require()
+        with open(self.device_path, "r+b", buffering=0) as dev:
+            return self._mine_on(dev, header, difficulty_bits)
+
+    def mine_batch(self, jobs: Sequence[dict]) -> List[MineOutcome]:
+        """All jobs over one open handle on the chain device (not one open/close per job)."""
+        if len(jobs) > MAX_BATCH_SIZE:
+            raise ValueError(f"batch exceeds {MAX_BATCH_SIZE}")
+        self._require()
+        with open(self.device_path, "r+b", buffering=0) as dev:
+            return [self._mine_on(dev, bytes(j["header"]), int(j.get("difficulty_bits", 16)))
+                    for j in jobs]
+
+    @staticmethod
+    def _mine_on(dev, header: bytes, difficulty_bits: int) -> MineOutcome:
         if len(header) != 80:
             raise ValueError("header must be 80 bytes")
         # Push a BM1387 work frame to the chain and read back a nonce response. The chip-side
         # target is fixed by firmware; difficulty_bits is verified host-side on the returned
         # nonce. Real UART framing is firmware-specific; this is the canonical driver path.
         frame = bm1387.new_work_from_header(header, work_id=1).encode()
-        with open(self.device_path, "r+b", buffering=0) as dev:
-            dev.write(frame)
-            resp = dev.read(6)
+        dev.write(frame)
+        resp = dev.read(6)
         res = bm1387.parse_nonce_response(resp)
         full = bytearray(header)
         struct.pack_into("<I", full, 76, res.nonce & _MASK)

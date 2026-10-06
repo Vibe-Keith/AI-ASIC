@@ -13,7 +13,9 @@ else in this package). Three things make it faster than re-hashing the header pe
     so threads do not help. When the expected work is at least ``PARALLEL_MIN_WORK`` hashes,
     the range is split into chunks searched by a persistent process pool. Chunks are consumed
     in nonce order, so the result (first valid nonce, its hash, hashes tried) is identical to a
-    serial search. Set ``AI_ASIC_WORKERS=1`` to disable; any pool failure falls back to serial.
+    serial search. :func:`search_many` (a batch of searches) also spreads shorter searches one
+    per process when together they are worth it. Set ``AI_ASIC_WORKERS=1`` to disable; any pool
+    failure falls back to serial.
 
 Pure Python, standard library only.
 """
@@ -25,7 +27,7 @@ import os
 import struct
 import threading
 from concurrent.futures import ProcessPoolExecutor
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 _MASK = 0xFFFFFFFF
 _PACK = struct.Struct("<I").pack
@@ -36,6 +38,7 @@ PARALLEL_MIN_WORK = 1 << 20
 CHUNK = 1 << 17
 
 SearchResult = Tuple[Optional[int], bytes, int]  # (nonce or None, digest, hashes tried)
+Job = Tuple[bytes, int, int, int]                # (header, difficulty_bits, start, count)
 
 
 def target_for_bits(difficulty_bits: int) -> bytes:
@@ -158,11 +161,52 @@ def search(header: bytes, difficulty_bits: int, start: int = 0,
     if len(header) != 80:
         raise ValueError("mining header must be exactly 80 bytes")
     count = max(0, int(count))
-    expected = min(count, 1 << max(0, min(int(difficulty_bits), 62)))
+    expected = _expected(difficulty_bits, count)
     n = workers()
     if n > 1 and expected >= PARALLEL_MIN_WORK and count > CHUNK:
         return _search_parallel(header, difficulty_bits, start, count, n)
     return search_serial(header, difficulty_bits, start, count)
+
+
+def _expected(difficulty_bits: int, count: int) -> int:
+    return min(max(0, int(count)), 1 << max(0, min(int(difficulty_bits), 62)))
+
+
+def _search_job(job: Job) -> SearchResult:
+    return search_serial(*job)
+
+
+def search_many(jobs: Sequence[Job]) -> List[SearchResult]:
+    """Several independent searches (a ``MineBatch``). Long ones are each split across the pool
+    (:func:`search`); short ones run one per worker process when together they are worth it,
+    else serially. Results are in job order and identical to searching each job alone."""
+    global _pool_broken
+    jobs = [(bytes(h), int(b), int(s), max(0, int(c))) for h, b, s, c in jobs]
+    for h, _, _, _ in jobs:
+        if len(h) != 80:
+            raise ValueError("mining header must be exactly 80 bytes")
+    out: List[Optional[SearchResult]] = [None] * len(jobs)
+    small = []
+    for i, (h, b, s, c) in enumerate(jobs):
+        if _expected(b, c) >= PARALLEL_MIN_WORK:
+            out[i] = search(h, b, s, c)
+        else:
+            small.append(i)
+    n = workers()
+    if (n > 1 and len(small) > 1
+            and sum(_expected(jobs[i][1], jobs[i][3]) for i in small) >= PARALLEL_MIN_WORK):
+        pool = _get_pool(n)
+        if pool is not None:
+            try:
+                for i, r in zip(small, pool.map(_search_job, [jobs[i] for i in small])):
+                    out[i] = r
+                small = []
+            except Exception:
+                _pool_broken = True
+                _shutdown_pool()
+    for i in small:
+        out[i] = search_serial(*jobs[i])
+    return out  # type: ignore[return-value]
 
 
 def leading_zero_bits(digest: bytes) -> int:

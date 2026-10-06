@@ -417,6 +417,11 @@ class ChatEngine:
                                     band_bits=int(cfg["lsh_band_bits"]),
                                     low_water=float(cfg["route_low_water"]),
                                     recall_similarity=float(cfg["route_recall_sim"]))
+        if cfg.get("lsh_prefetch_table", True) and (cfg["route_context"]
+                                                    or cfg["draft_retrieval"]):
+            # The whole LSH bucket table on the ASIC, in the background: replies then never
+            # wait on the device for a bucket ID.
+            self.buckets.prefetch_table(int(cfg["lsh_bands"]), int(cfg["lsh_band_bits"]))
         self.store = DraftStore(Path(cfg["draft_store_path"]) if cfg.get("draft_store_path")
                                 else cache_dir(self.root) / "draft_store.jsonl")
         self._llm = None
@@ -549,10 +554,12 @@ class ChatEngine:
                                   want_query_buckets=retrieval)
         result.route = route
         b = route.buckets
-        if b.searches or b.cache_hits:
+        if b.searches or b.cache_hits or b.waited:
             trace.add(Stage("route.buckets", b.device, ops=b.hashes, seconds=b.seconds,
                             detail=f"{b.searches} nonce searches in {b.round_trips} round "
-                                   f"trip(s), {b.cache_hits} cached (LSH bucket IDs)"))
+                                   f"trip(s), {b.cache_hits} cached"
+                                   + (f", {b.waited} from the table still in flight"
+                                      if b.waited else "") + " (LSH bucket IDs)"))
         if cfg["route_context"]:
             detail = (f"{route.reason}; prompt {route.tokens_full} -> {route.tokens_routed} "
                       f"tokens" if route.routed else

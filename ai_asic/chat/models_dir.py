@@ -67,6 +67,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "lsh_band_bits": 6,
     "bucket_difficulty": 6,
     "bucket_max_nonces": 4096,
+    # Search the whole bucket table (lsh_bands x 2**lsh_band_bits headers) on the ASIC in the
+    # background at startup, so no reply waits on the device for a bucket ID.
+    "lsh_prefetch_table": True,
     "use_cache": True,
     "seal_difficulty": 10,
     "seal_timeout": 30,  # seconds to wait for a real miner's share before sealing on the host

@@ -26,7 +26,7 @@ from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence
 
 from ai_asic.server.device import MAX_BATCH_SIZE
-from ai_asic.workloads.split_model import DEVICE_ASIC, DEVICE_HOST, _software_mine
+from ai_asic.workloads.split_model import DEVICE_ASIC, DEVICE_HOST, software_mine_jobs
 
 WARM_STAGE = "warm"
 _WARM_HEADER = b"AI-ASIC keep-warm".ljust(80, b"\x00")
@@ -297,7 +297,8 @@ class HashAccelerator:
                     self._lost_device()
                     raw = None
             if raw is None:
-                raw = [_software_mine(j.header, j.difficulty_bits, j.max_nonces) for j in batch]
+                raw = software_mine_jobs([(j.header, j.difficulty_bits, j.max_nonces)
+                                          for j in batch])
             elapsed = time.perf_counter() - t0
             total = sum(r.hashes_tried for r in raw) or 1
             per_stage: Dict[str, List] = {}

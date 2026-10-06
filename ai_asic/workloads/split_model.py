@@ -152,6 +152,42 @@ class MiningBackend:
                 self._client = None
         return _software_mine(header, self.difficulty_bits, self.max_nonces)
 
+    def mine_batch(self, headers: List[bytes]) -> List[MineOutcome]:
+        """Every header in one ``MineBatch`` round trip (the device works on them together);
+        on the host, the searches are spread over processes when they are long enough."""
+        if self._client is not None:
+            try:
+                rs = self._client.mine_batch([(h, self.difficulty_bits, self.max_nonces)
+                                              for h in headers])
+                return [MineOutcome(r.nonce, r.found, r.hash_hex, r.leading_zeros,
+                                    r.hashes_tried) for r in rs]
+            except Exception:
+                self.is_hardware = False
+                self.label = "host CPU (software fallback; miner unreachable)"
+                self._client = None
+        return software_mine_many(headers, self.difficulty_bits, self.max_nonces)
+
+
+def software_mine_many(headers: Sequence[bytes], difficulty_bits: int,
+                       max_nonces: int, start: int = 0) -> List[MineOutcome]:
+    """:func:`_software_mine` for several headers at once (same results, one per header)."""
+    return software_mine_jobs([(h, difficulty_bits, max_nonces, start) for h in headers])
+
+
+def software_mine_jobs(jobs: Sequence[tuple]) -> List[MineOutcome]:
+    """:func:`_software_mine` for ``(header, difficulty_bits, max_nonces[, start])`` jobs,
+    searched together (spread over processes when long enough); results in job order."""
+    norm = [(j[0], int(j[1]), int(j[3]) if len(j) > 3 else 0, int(j[2])) for j in jobs]
+    out = []
+    for (_, _, start, count), (nonce, digest, tried) in zip(norm,
+                                                            nonce_search.search_many(norm)):
+        if nonce is not None:
+            out.append(MineOutcome(nonce, True, digest.hex(),
+                                   nonce_search.leading_zero_bits(digest), tried))
+        else:
+            out.append(MineOutcome((start + count) & _MASK, False, "", 0, tried))
+    return out
+
 
 # --- the model ---------------------------------------------------------------
 
@@ -212,13 +248,13 @@ class SplitModel:
 
         # Stage 2 - ASIC (or host fallback): mine one nonce per mining neuron.
         t0 = time.perf_counter()
-        nonces: List[int] = []
-        total_tried = 0
-        for mn in self.mining:
-            header = mn.build_header(features)
-            outcome = backend.mine(header)
-            nonces.append(outcome.nonce)
-            total_tried += outcome.hashes_tried
+        headers = [mn.build_header(features) for mn in self.mining]
+        if hasattr(backend, "mine_batch"):
+            outcomes = backend.mine_batch(headers)  # one round trip for the whole layer
+        else:
+            outcomes = [backend.mine(h) for h in headers]
+        nonces: List[int] = [o.nonce for o in outcomes]
+        total_tried = sum(o.hashes_tried for o in outcomes)
         trace.add(Stage("mining", backend.device, ops=len(self.mining),
                         seconds=time.perf_counter() - t0,
                         detail=f"{len(self.mining)} headers, {total_tried:,} nonces rolled, "
