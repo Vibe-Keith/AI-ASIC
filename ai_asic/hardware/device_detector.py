@@ -80,8 +80,8 @@ def _cgminer_reachable(host: str, port: int) -> bool:
         return False
 
 
-def detection_summary(cgminer_host: Optional[str] = None) -> str:
-    caps = detect_asic(cgminer_host)
+def detection_summary(cgminer_host: Optional[str] = None, cgminer_port: int = 4028) -> str:
+    caps = detect_asic(cgminer_host, cgminer_port)
     profile: MinerProfile = caps["profile"]  # type: ignore[assignment]
     status = "AVAILABLE" if caps["available"] else "UNAVAILABLE"
     lines = [

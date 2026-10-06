@@ -193,6 +193,36 @@ class BM1387Work:
         return bytes(buf)
 
 
+def decode_work(frame: bytes, *, verify_crc: bool = True) -> BM1387Work:
+    """Inverse of :meth:`BM1387Work.encode`.
+
+    Parses a chain frame ``[work_id:4 LE][midstate:32]*N[data:12][crc16:2 BE]`` back into a
+    :class:`BM1387Work`. The number of midstates is inferred from the frame length. This is
+    what receiving firmware (or the virtual chip in ``simulator.py``) does to recover the
+    work it was handed. With ``verify_crc`` set, a corrupted frame raises ``ValueError`` -
+    the same rejection a real chip performs before it will mine.
+    """
+    # 4 (work_id) + 32*N (midstates) + 12 (data) + 2 (crc16)
+    body = len(frame) - 4 - WORK_DATA_BYTES - 2
+    if body < MIDSTATE_BYTES or body % MIDSTATE_BYTES != 0:
+        raise ValueError(f"malformed work frame: {len(frame)} bytes")
+    n_midstates = body // MIDSTATE_BYTES
+    if n_midstates > MAX_MIDSTATES:
+        raise ValueError(f"too many midstates in frame: {n_midstates}")
+    if verify_crc:
+        want = struct.unpack(">H", frame[-2:])[0]
+        got = crc16(frame[:-2])
+        if want != got:
+            raise ValueError(f"work frame CRC16 mismatch: got 0x{got:04x}, want 0x{want:04x}")
+    work_id = struct.unpack("<I", frame[0:4])[0]
+    midstates = [
+        frame[4 + i * MIDSTATE_BYTES: 4 + (i + 1) * MIDSTATE_BYTES]
+        for i in range(n_midstates)
+    ]
+    data = frame[4 + body: 4 + body + WORK_DATA_BYTES]
+    return BM1387Work(work_id=work_id, midstates=midstates, data=data)
+
+
 def new_work_from_header(header: bytes, work_id: int) -> BM1387Work:
     """Build a single-midstate work item from an 80-byte Bitcoin header. The nonce field
     (bytes 76-79) is ignored; the chip supplies the nonce."""
@@ -228,6 +258,17 @@ class BM1387NonceResult:
     nonce: int
     work_id: int = 0
     midstate_index: int = 0
+
+
+def encode_nonce_response(nonce: int, work_id: int = 0, midstate_index: int = 0) -> bytes:
+    """Build the 6-byte nonce response a BM1387 chip returns up the chain:
+
+        [nonce:4 BE][work_id:1][midstate_index/chip:1]
+
+    Inverse of :func:`parse_nonce_response`. The virtual chip in ``simulator.py`` uses this
+    to report a golden nonce exactly as real firmware frames it.
+    """
+    return struct.pack(">IBB", nonce & _MASK, work_id & 0xFF, midstate_index & 0x03)
 
 
 def parse_nonce_response(frame: bytes) -> BM1387NonceResult:

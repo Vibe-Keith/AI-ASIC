@@ -102,6 +102,11 @@ cli
 /pipeline/AlpacaDataCleaned-main
 pipeline/AlpacaDataCleaned-main.zip
 
+# --- AI files (weights and caches; layout, README and config are tracked) ---
+ai_models/llm/*.gguf
+ai_models/llm/*.part
+ai_models/cache/
+
 # --- Python ---
 __pycache__/
 *.py[cod]

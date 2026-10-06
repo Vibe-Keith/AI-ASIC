@@ -61,6 +61,11 @@ class MiningNeuron:
         header = self._build_header(projections)
         return self._mine(header)
 
+    def build_header(self, input_vec: Sequence[float]) -> bytes:
+        """Project ``input_vec`` into the 80-byte header this neuron would mine, without
+        mining it. Lets an external backend (e.g. an ASIC) perform the nonce search."""
+        return self._build_header(self._compute_projections(input_vec))
+
     def _compute_projections(self, input_vec: Sequence[float]) -> List[float]:
         out = []
         for i, row in enumerate(self.weights):
