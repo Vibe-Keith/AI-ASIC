@@ -163,8 +163,11 @@ The run then independently re-hashes the **full 80-byte header** with `hashlib` 
 the chip's nonce genuinely solves it. If `midstate math == hashlib over full header`, the
 host-side encoder in this repo would drive a real S9.
 
-`--difficulty` sets the required leading zero bits (16 ≈ 65k rolls, a few seconds in pure
-Python); the reported real-chip time is scaled to the model's nominal hash rate. Library use:
+`--difficulty` sets the required leading zero bits (16 ≈ 65k rolls); the reported real-chip
+time is scaled to the model's nominal hash rate. By default the virtual chip rolls nonces with
+`hashlib` resumed from the same midstate and re-derives the winning nonce through the
+pure-Python chip model (identical result, about 13 ms instead of 7 s at difficulty 16);
+`--cycle-model` rolls every nonce through the pure-Python model. Library use:
 
 ```python
 from ai_asic.hardware.bitcoin_header import prepare_asic_job
@@ -275,7 +278,7 @@ the one operation a BM1387 natively performs: **nonce search** over an 80-byte h
 | route | host | **KV-block routing**: once the prompt outgrows a budget, keep the newest exchanges plus the old ones whose buckets match the new message, so the CPU attends over a shorter context |
 | retrieve | host | past replies to similar prompts (found by bucket) become extra draft candidates |
 | llm | host | llama.cpp prefill, verification passes, sampling - with exact counts of verification passes and attention work |
-| draft | host | speculative drafts: n-gram index (SHA-256 keys, `hashlib`) with consensus over every earlier occurrence and length capped by match strength |
+| draft | host | speculative drafts: n-gram index (token-tuple keys) with consensus over every earlier occurrence and length capped by match strength |
 | seal | **ASIC** | proof-of-work nonce over each turn's chained transcript digest, mined in the background → tamper-evident log |
 
 **Only nonce searches are counted as ASIC work.** Hashing arbitrary data (fingerprints, draft
@@ -376,7 +379,7 @@ ai_models/
   config.json   chat defaults: model, system prompt, n_ctx, sampling, draft/routing/cache/seal options
   llm/          GGUF language models (*.gguf)
   hasher/       trained HASHER split-models (*.json) - the Workload tab saves here
-  cache/        responses.json (response cache), transcripts.jsonl (sealed chat log),
+  cache/        responses.jsonl (response cache), transcripts.jsonl (sealed chat log),
                 draft_store.jsonl (past replies used as draft candidates)
 ```
 
@@ -423,10 +426,40 @@ These numbers were measured before the draft and routing changes described in
 
 ## Performance
 
-SHA-256 itself runs through `hashlib` (OpenSSL C). Large software batches are spread across
-worker threads (`hashlib` releases the GIL around the digest call). The highest throughput
-comes from offloading the final nonce search to the ASIC over the cgminer API, not from the
-host CPU.
+SHA-256 itself runs through `hashlib` (OpenSSL C). `hashlib` only releases the GIL for inputs
+of 2 KiB or more, so batches of small inputs run in a plain loop (threads made them 48x slower).
+
+Every software nonce search (split-model mining layer, host fallback, virtual chip, seals) goes
+through `ai_asic/hashing/nonce_search.py`: the header's first 76 bytes are hashed once and the
+`hashlib` state copied per nonce, and the target is a byte comparison. Searches expected to take
+at least 2^20 hashes are split across a process pool in nonce order, so the first valid nonce is
+the same as a serial search. Measured on a 4-core VM:
+
+| Search | Before | Now |
+|--------|--------|-----|
+| serial software nonce search | 827 kH/s | ~1.2 MH/s |
+| 22-bit search (19M hashes) | ~23 s (at 827 kH/s) | 3.7 s (4 processes) |
+| `simulate --difficulty 16` | 7.3 s | 13 ms |
+
+Set `AI_ASIC_WORKERS=1` to keep searches in one process. The highest throughput still comes from
+the ASIC, not the host CPU.
+
+For chat, llama.cpp does nearly all the work. Its CPU settings live in `ai_models/config.json`
+(`n_threads`, `n_threads_batch`, `n_batch`, `n_ubatch`, `flash_attn`, `kv_cache_type`) and on
+the command line (`chat --threads N --flash-attn --kv-cache q8_0`). Measured on a 4-vCPU VM with
+a random-weight model shaped like Qwen2.5-0.5B (Q4_K_M, 700-token context, best of 3):
+
+| llama.cpp setting | Prompt tok/s | Decode tok/s |
+|-------------------|-------------:|-------------:|
+| defaults (2 decode threads) | 268 | 21.8 |
+| `n_threads` 4 | 269 | 35.4 |
+| `flash_attn` | 303 | 17.4 |
+| `flash_attn` + `n_threads` 4 | 325 | 29.6 |
+| `flash_attn` + `n_threads` 4 + q8_0 KV | 240 | 37.2 |
+
+The thread count matters most. On a CPU with SMT/hyperthreading the physical core count is
+usually best, so try `--threads` at both the physical and the logical core count. Flash
+attention is off by default because it slowed decoding here.
 
 ## Tests
 

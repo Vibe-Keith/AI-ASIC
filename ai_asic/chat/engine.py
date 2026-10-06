@@ -14,13 +14,14 @@ Per turn (the device in brackets is what the trace reports):
                           candidates
     [host] llm            llama.cpp prefill, verification passes and sampling, with exact counts
                           of evaluated tokens, verification passes and attention pairs
-    [host] draft          the n-gram draft index (SHA-256 keys via hashlib, consensus drafts)
+    [host] draft          the n-gram draft index (token-tuple keys, consensus drafts)
     [ASIC] seal           proof-of-work nonce over the turn's chained transcript digest, mined in
                           the background - the reply does not wait for it
 
-Only nonce searches count as ASIC work. A BM1387 cannot hash arbitrary data, so fingerprint,
-draft-key and digest hashing run on the host and the trace says so. When no hasher-server or
-miner is attached, the nonce searches run on the host too and are reported as such.
+Only nonce searches count as ASIC work. A BM1387 cannot hash arbitrary data, so fingerprint
+and digest hashing (and the draft index) run on the host and the trace says so. When no
+hasher-server or miner is attached, the nonce searches run on the host too and are reported
+as such.
 """
 from __future__ import annotations
 
@@ -131,21 +132,51 @@ class TurnResult:
 # --- response cache ----------------------------------------------------------
 
 class ResponseCache:
+    """SHA-256-addressed reply cache, stored as append-only JSONL (one line per reply; the last
+    line for a key wins), so storing a reply costs one appended line rather than rewriting the
+    whole file. A legacy ``responses.json`` next to it is imported once."""
+
     def __init__(self, path: Path):
-        self.path = path
+        self.path = Path(path)
+        self._data: Dict[str, Dict] = {}
         try:
-            self._data: Dict[str, Dict] = json.loads(path.read_text(encoding="utf-8"))
+            with open(self.path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                        self._data[rec.pop("key")] = rec
+                    except (ValueError, KeyError, TypeError, AttributeError):
+                        continue
+        except OSError:
+            self._import_legacy(self.path.with_suffix(".json"))
+
+    def _import_legacy(self, legacy: Path) -> None:
+        if legacy == self.path:
+            return
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            self._data = {}
+            return
+        if not isinstance(data, dict):
+            return
+        self._data = {k: v for k, v in data.items() if isinstance(v, dict) and "text" in v}
+        try:
+            with open(self.path, "w", encoding="utf-8") as fh:
+                for k, v in self._data.items():
+                    fh.write(json.dumps({"key": k, **v}) + "\n")
+        except OSError:
+            pass
 
     def get(self, key: str) -> Optional[str]:
         hit = self._data.get(key)
         return hit["text"] if hit else None
 
     def put(self, key: str, text: str, model: str) -> None:
-        self._data[key] = {"text": text, "model": model, "time": int(time.time())}
+        rec = {"text": text, "model": model, "time": int(time.time())}
+        self._data[key] = rec
         try:
-            self.path.write_text(json.dumps(self._data, indent=1), encoding="utf-8")
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"key": key, **rec}) + "\n")
         except OSError:
             pass
 
@@ -330,6 +361,38 @@ def verify_transcripts(path: Path) -> Tuple[bool, int, List[str]]:
 
 # --- engine ------------------------------------------------------------------
 
+# GGML tensor type ids accepted by llama-cpp-python's type_k / type_v.
+_KV_TYPES = {"f32": 0, "f16": 1, "q4_0": 2, "q4_1": 3, "q5_0": 6, "q5_1": 7, "q8_0": 8}
+
+
+def llama_kwargs(cfg: Dict, llama_cls=None) -> Dict:
+    """llama.cpp performance settings from the chat config (see ``models_dir.DEFAULT_CONFIG``).
+    Settings left null keep llama-cpp-python's defaults; with ``llama_cls``, settings its
+    constructor does not accept (older versions) are dropped."""
+    kw: Dict = {"n_ctx": int(cfg["n_ctx"])}
+    for key in ("n_threads", "n_threads_batch", "n_batch", "n_ubatch"):
+        if cfg.get(key):
+            kw[key] = int(cfg[key])
+    if cfg.get("flash_attn") is not None:
+        kw["flash_attn"] = bool(cfg["flash_attn"])
+    kv = str(cfg.get("kv_cache_type") or "f16").lower()
+    if kv not in _KV_TYPES:
+        raise ValueError(f"kv_cache_type must be one of {sorted(_KV_TYPES)}, not {kv!r}")
+    if kv != "f16":
+        kw["type_k"] = kw["type_v"] = _KV_TYPES[kv]
+        kw.setdefault("flash_attn", True)  # llama.cpp needs it for a quantized V cache
+    if llama_cls is not None:
+        try:
+            import inspect
+
+            params = inspect.signature(llama_cls.__init__).parameters
+            if not any(p.kind is p.VAR_KEYWORD for p in params.values()):
+                kw = {k: v for k, v in kw.items() if k in params}
+        except (TypeError, ValueError):
+            pass
+    return kw
+
+
 class ChatEngine:
     def __init__(self, model_path: Optional[str] = None,
                  accelerator: Optional[HashAccelerator] = None,
@@ -363,7 +426,7 @@ class ChatEngine:
         if llm is not None:
             self._adopt(llm)
         self._lock = threading.Lock()
-        self.cache = ResponseCache(cache_dir(self.root) / "responses.json")
+        self.cache = ResponseCache(cache_dir(self.root) / "responses.jsonl")
         self.log = TranscriptLog.for_path(cache_dir(self.root) / "transcripts.jsonl")
         self.new_chat()
 
@@ -418,8 +481,8 @@ class ChatEngine:
                 "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu"
             ) from exc
         draft = make_llama_draft_model(self.draft) if self.cfg["use_draft"] else None
-        self._adopt(Llama(model_path=str(self.model_path), n_ctx=int(self.cfg["n_ctx"]),
-                          draft_model=draft, verbose=False))
+        self._adopt(Llama(model_path=str(self.model_path), draft_model=draft, verbose=False,
+                          **llama_kwargs(self.cfg, Llama)))
 
     # -- one turn -------------------------------------------------------------
     def reply(self, user_text: str, on_token: Optional[Callable[[str], None]] = None,
@@ -477,7 +540,7 @@ class ChatEngine:
 
     def _generate(self, msgs, user_text, on_token, max_tokens, temperature,
                   result: TurnResult, cache_key: str) -> str:
-        acc, cfg, trace = self.acc, self.cfg, result.trace
+        cfg, trace = self.cfg, result.trace
         use_draft = bool(cfg["use_draft"])
         retrieval = use_draft and self._draft_wired and bool(cfg["draft_retrieval"])
 
@@ -520,8 +583,7 @@ class ChatEngine:
         # [host] llama.cpp generation, metered
         d.discard_pending()
         before = (d.calls, d.proposed, d.scored, d.accepted, d.candidates, d.ref_drafts)
-        draft_s0 = acc.meter("draft").seconds
-        draft_ops0 = acc.meter("draft").ops
+        draft_s0, draft_ops0 = d.seconds, d.windows
         metered = self.meter is not None and self.meter.available
         if metered:
             self.meter.begin()
@@ -555,7 +617,7 @@ class ChatEngine:
                 (d.calls, d.proposed, d.scored, d.accepted, d.candidates, d.ref_drafts), before))
         result.draft_lookups, result.draft_proposed = lookups, proposed
         result.draft_scored, result.draft_accepted = scored, accepted
-        draft_secs = acc.meter("draft").seconds - draft_s0
+        draft_secs = d.seconds - draft_s0
 
         detail = (f"{ntok} tokens, {result.decode_tps:.1f} tok/s decode, first token "
                   f"{result.ttft_s * 1000:.0f} ms")
@@ -572,7 +634,7 @@ class ChatEngine:
                             f"{stats.rejected_tokens} unused draft tokens")
             else:
                 per_pass = f"~{ntok / lookups:.2f} tok/pass" if lookups else "no passes"
-            trace.add(Stage("draft", DEVICE_HOST, ops=acc.meter("draft").ops - draft_ops0,
+            trace.add(Stage("draft", DEVICE_HOST, ops=d.windows - draft_ops0,
                             seconds=draft_secs,
                             detail=f"{lookups} lookups, {proposed} proposed from {cands} "
                                    f"candidates, {accepted}/{scored} accepted ({rate}), "

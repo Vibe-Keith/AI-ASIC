@@ -5,20 +5,21 @@
   cgminer/bmminer JSON-RPC API, with software fallback. This is the cross-platform path
   that works against an Antminer S9 (or newer) over the network from Windows.
 
-"Speed" note: SHA-256 itself is done by hashlib (C). Batch work can be spread across
-threads; hashlib releases the GIL around the digest call, so threads give real speedup for
-large batches. The highest throughput comes from the ASIC over cgminer, not the CPU.
+"Speed" note: SHA-256 itself is done by hashlib (C). hashlib only releases the GIL for inputs
+of 2 KiB or more, so threads slow down batches of small inputs (48x in testing); batches run in
+a plain loop. Long nonce searches use processes instead (``ai_asic.hashing.nonce_search``). The
+highest throughput comes from the ASIC over cgminer, not the CPU.
 """
 from __future__ import annotations
 
 import hashlib
-import struct
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Sequence
 
-# Above this batch size, spread software hashing across worker threads.
-_PARALLEL_THRESHOLD = 512
+from ai_asic.hashing import nonce_search
+
+# Difficulty 1 as this package checks it: first 3 digest bytes zero and the 4th < 0x10.
+DIFFICULTY1_BITS = 28
 
 
 def sha256(data: bytes) -> bytes:
@@ -56,7 +57,7 @@ class SoftwareHashMethod(HashMethod):
     """Pure-software SHA-256 backend (hashlib)."""
 
     def __init__(self, max_workers: Optional[int] = None):
-        self.max_workers = max_workers
+        self.max_workers = max_workers  # kept for API compatibility; batches are not threaded
 
     def name(self) -> str:
         return "Software (hashlib SHA-256)"
@@ -68,23 +69,22 @@ class SoftwareHashMethod(HashMethod):
         return hashlib.sha256(data).digest()
 
     def compute_batch(self, data: Sequence[bytes]) -> List[bytes]:
-        if len(data) >= _PARALLEL_THRESHOLD:
-            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-                return list(pool.map(lambda d: hashlib.sha256(d).digest(), data))
-        return [hashlib.sha256(d).digest() for d in data]
+        sha = hashlib.sha256
+        return [sha(d).digest() for d in data]
 
     def mine_header(self, header: bytes, nonce_start: int, nonce_end: int) -> int:
         """Find the first nonce whose double-SHA-256 meets the Difficulty-1 target
         (first 3 bytes zero, 4th < 0x10). Deterministic for a given header + range."""
-        if len(header) != 80:
-            raise ValueError("mining header must be exactly 80 bytes")
-        work = bytearray(header)
-        for nonce in range(nonce_start, nonce_end + 1):
-            struct.pack_into("<I", work, 76, nonce & 0xFFFFFFFF)
-            h = hashlib.sha256(hashlib.sha256(bytes(work)).digest()).digest()
-            if h[0] == 0 and h[1] == 0 and h[2] == 0 and h[3] < 0x10:
-                return nonce
-        return nonce_end
+        return mine_difficulty1(header, nonce_start, nonce_end)
+
+
+def mine_difficulty1(header: bytes, nonce_start: int, nonce_end: int) -> int:
+    """First nonce in ``[nonce_start, nonce_end]`` meeting Difficulty 1, else ``nonce_end``."""
+    if len(header) != 80:
+        raise ValueError("mining header must be exactly 80 bytes")
+    nonce, _, _ = nonce_search.search(header, DIFFICULTY1_BITS, nonce_start,
+                                      nonce_end - nonce_start + 1)
+    return nonce if nonce is not None else nonce_end
 
 
 class ASICHashMethod(HashMethod):

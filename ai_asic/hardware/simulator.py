@@ -18,8 +18,13 @@ If all four line up, the host-side encode/decode path in this repo would drive a
 
 The on-chip SHA-256 is pure Python (``bm1387._sha256_compress``) on purpose: it demonstrates
 the midstate shortcut a real ASIC exploits (block 1 is pre-hashed by the host, the chip only
-rolls the nonce through block 2). It is slow, so pick a modest ``difficulty_bits`` for a live
-demo; the reported *simulated* time is scaled to a real chip's nominal hash rate regardless.
+rolls the nonce through block 2). Rolling every nonce through it runs at a few kH/s, so by
+default (``SimConfig.fast``) :func:`simulate_header` rolls with ``hashlib`` resumed from the
+same midstate (``ai_asic.hashing.nonce_search``, ~1 MH/s per core, process-parallel for long
+searches) and re-derives the winning nonce through the pure-Python model, raising on any
+disagreement. Results are identical (same first nonce, hash and count); ``fast=False`` (CLI
+``--cycle-model``) rolls every nonce through the model. The reported *simulated* time is
+scaled to a real chip's nominal hash rate regardless.
 
 Pure Python, standard library only, cross-platform.
 """
@@ -36,6 +41,7 @@ from typing import List, Optional
 from ai_asic.hardware import bm1387
 from ai_asic.hardware.bm1387 import _MASK, _SHA256_INIT, _sha256_compress
 from ai_asic.hardware.miner_profiles import MinerProfile, default_profile, detect_profile
+from ai_asic.hashing import nonce_search
 
 # Length of an 80-byte Bitcoin header, in bits, as the SHA-256 message-length suffix.
 _HEADER_BITLEN = struct.pack(">Q", 80 * 8)
@@ -76,6 +82,7 @@ class SimConfig:
     nominal_hashrate: float = 13.5e12  # H/s a real S9 sustains (for the "real chip" estimate)
     max_nonces: int = 1 << 24          # give up after this many rolls (per midstate)
     start_nonce: int = 0
+    fast: bool = True                  # hashlib roll + model check of the winner (see module doc)
 
 
 @dataclass
@@ -104,9 +111,14 @@ class VirtualBM1387:
         self.work = bm1387.decode_work(frame, verify_crc=True)
         return self.work
 
-    def mine(self) -> SimResult:
+    def mine(self, header: Optional[bytes] = None) -> SimResult:
         """Roll the nonce (and every loaded midstate, AsicBoost-style) until a hash meets
-        the difficulty target or the nonce budget is exhausted."""
+        the difficulty target or the nonce budget is exhausted.
+
+        With ``config.fast`` and the 80-byte ``header`` the work came from (single midstate),
+        the roll runs in ``hashlib`` from that midstate and only the winning nonce goes through
+        the pure-Python model; the header is checked against the loaded midstate and tail first.
+        """
         if self.work is None:
             raise RuntimeError("no work loaded; call load_work() first")
         cfg = self.config
@@ -116,6 +128,16 @@ class VirtualBM1387:
         tried = 0
         t0 = time.perf_counter()
         end = cfg.start_nonce + cfg.max_nonces
+        if (cfg.fast and header is not None and len(header) == 80 and len(midstates) == 1
+                and bytes(header[64:76]) == bytes(data)
+                and bm1387.compute_midstate(bytes(header[:64])) == midstates[0]):
+            nonce, digest, tried = nonce_search.search(header, target_zeros, cfg.start_nonce,
+                                                       cfg.max_nonces)
+            if nonce is None:
+                return self._result(False, end & _MASK, 0, b"\x00" * 32, tried, t0)
+            if _finish_double_sha_from_midstate(midstates[0], data, nonce) != digest:
+                raise RuntimeError("midstate model disagrees with the nonce search")
+            return self._result(True, nonce, 0, digest, tried, t0)
         for nonce in range(cfg.start_nonce, end):
             for mi, ms in enumerate(midstates):
                 digest = _finish_double_sha_from_midstate(ms, data, nonce)
@@ -179,10 +201,11 @@ def simulate_header(header: bytes, work_id: int = 1,
     work = bm1387.new_work_from_header(header, work_id)
     frame = work.encode()
 
-    # Chip side: ingest the frame (CRC-checked) and mine from midstate + tail only.
+    # Chip side: ingest the frame (CRC-checked) and mine from midstate + tail (with cfg.fast the
+    # roll uses hashlib from the same midstate and the winner is re-derived by the model).
     chip = VirtualBM1387(cfg)
     chip.load_work(frame)
-    res = chip.mine()
+    res = chip.mine(header)
 
     # Host side: parse the chip's response frame back into a nonce.
     parsed = bm1387.parse_nonce_response(res.response_frame)

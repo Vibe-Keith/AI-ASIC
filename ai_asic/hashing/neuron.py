@@ -11,7 +11,7 @@ import math
 import struct
 from typing import List, Optional, Sequence
 
-from ai_asic.hashing.methods import HashMethod, double_sha256
+from ai_asic.hashing.methods import HashMethod, mine_difficulty1
 
 DIFFICULTY1_NBITS = 0x1D00FFFF
 GOLDEN_RATIO = 2654435769
@@ -97,13 +97,7 @@ class MiningNeuron:
         return self._mine_software(header)
 
     def _mine_software(self, header: bytes) -> int:
-        work = bytearray(header)
-        for nonce in range(self.nonce_start, self.nonce_end + 1):
-            struct.pack_into("<I", work, 76, nonce & _MASK)
-            h = double_sha256(bytes(work))
-            if h[0] == 0 and h[1] == 0 and h[2] == 0 and h[3] < 0x10:
-                return nonce
-        return self.nonce_end
+        return mine_difficulty1(header, self.nonce_start, self.nonce_end)
 
 
 def _float32_bits(f: float) -> int:

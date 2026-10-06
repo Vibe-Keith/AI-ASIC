@@ -121,13 +121,16 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
         chip_count=profile.chip_count if profile and profile.chip_count else args.chips,
         nominal_hashrate=float(profile.nominal_hashrate) if profile else args.hashrate,
         max_nonces=args.max_nonces,
+        fast=not args.cycle_model,
     )
 
     chip_name = f"{profile.model} ({profile.chip})" if profile else "BM1387 (generic S9)"
     print(f"Virtual miner:     {chip_name}")
     print(f"Target difficulty: {cfg.difficulty_bits} leading zero bits")
     print(f"Modeled chips:     {cfg.chip_count}  @  {cfg.nominal_hashrate / 1e12:.2f} TH/s nominal")
-    print("Mining from midstate + 12-byte tail only (as the real chip does)...")
+    print("Mining from midstate + 12-byte tail (as the real chip does)"
+          + ("; every nonce through the pure-Python model..." if args.cycle_model else
+             "; hashlib roll, winner re-checked by the pure-Python model..."))
     print()
 
     sim = simulate_header(header, work_id=args.work_id, config=cfg)
@@ -146,7 +149,8 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
     print(f"Nonces rolled:     {r.hashes_tried:,}")
     print(f"Response frame:    {r.response_frame.hex()}  -> host parsed nonce 0x{sim.parsed.nonce:08x}")
     print()
-    print(f"Simulated run:     {_fmt_duration(r.sim_seconds)} (pure-Python model)")
+    print(f"Simulated run:     {_fmt_duration(r.sim_seconds)} "
+          f"({'pure-Python model' if args.cycle_model else 'hashlib roll + model check'})")
     print(f"Real-chip estimate:{_fmt_duration(r.est_real_seconds)} at {cfg.nominal_hashrate / 1e12:.1f} TH/s")
     print()
     print("Verification (would this drive a real S9?):")
@@ -268,6 +272,12 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         overrides["route_context"] = False
     if args.route_budget is not None:
         overrides["route_budget_tokens"] = args.route_budget
+    if args.threads is not None:
+        overrides["n_threads"] = args.threads
+    if args.flash_attn:
+        overrides["flash_attn"] = True
+    if args.kv_cache is not None:
+        overrides["kv_cache_type"] = args.kv_cache
     engine = ChatEngine(args.model, accelerator=acc, **overrides)
 
     print(f"Model:        {engine.model_name}")
@@ -607,6 +617,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="nominal H/s for the real-chip time estimate (default 13.5e12)")
     sim.add_argument("--max-nonces", type=int, default=1 << 24,
                      help="give up after this many nonce rolls (default 16,777,216)")
+    sim.add_argument("--cycle-model", action="store_true",
+                     help="roll every nonce through the pure-Python chip model (slow, ~3 kH/s)")
     sim.set_defaults(func=_cmd_simulate)
 
     sv = sub.add_parser("serve", help="run the on-device hasher-server")
@@ -669,6 +681,12 @@ def build_parser() -> argparse.ArgumentParser:
     ch.add_argument("--route-budget", type=int, default=None,
                     help="prompt tokens before routing compacts the history (default 768)")
     ch.add_argument("--no-cache", action="store_true", help="disable the response cache")
+    ch.add_argument("--threads", type=int, default=None,
+                    help="llama.cpp decode threads (default: half the logical cores)")
+    ch.add_argument("--flash-attn", action="store_true",
+                    help="enable llama.cpp flash attention (slower decode in testing; measure)")
+    ch.add_argument("--kv-cache", choices=("f16", "q8_0"), default=None,
+                    help="KV-cache type (q8_0 halves its memory and turns on flash attention)")
     ch.add_argument("--seal-difficulty", type=int, default=None,
                     help="transcript seal difficulty in bits (0 disables sealing)")
     ch.add_argument("--temperature", type=float, default=None)

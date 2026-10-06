@@ -21,13 +21,12 @@ mining server). Pure Python, standard library only.
 """
 from __future__ import annotations
 
-import hashlib
 import json
-import struct
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
+from ai_asic.hashing import nonce_search
 from ai_asic.hashing.network import HashNetwork, float_slice_to_bytes
 from ai_asic.hashing.neuron import HashNeuron, MiningNeuron, nonce_to_activation
 
@@ -97,18 +96,11 @@ def _software_mine(header: bytes, difficulty_bits: int, max_nonces: int,
                    start: int = 0) -> MineOutcome:
     """Host-side nonce search to the same target the virtual chip uses (leading zero bits of
     the double-SHA-256), so host and ASIC paths are directly comparable."""
-    work = bytearray(header)
-    need = difficulty_bits
+    nonce, digest, tried = nonce_search.search(header, difficulty_bits, start, max_nonces)
+    if nonce is not None:
+        return MineOutcome(nonce, True, digest.hex(), nonce_search.leading_zero_bits(digest),
+                           tried)
     end = start + max_nonces
-    tried = 0
-    for nonce in range(start, end):
-        struct.pack_into("<I", work, 76, nonce & _MASK)
-        h = hashlib.sha256(hashlib.sha256(bytes(work)).digest()).digest()
-        tried += 1
-        value = int.from_bytes(h, "big")
-        if (256 - value.bit_length() if value else 256) >= need:
-            return MineOutcome(nonce, True, h.hex(),
-                               256 - value.bit_length() if value else 256, tried)
     return MineOutcome(end & _MASK, False, "", 0, tried)
 
 

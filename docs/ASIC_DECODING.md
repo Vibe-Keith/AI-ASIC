@@ -43,7 +43,7 @@ runs on the CPU, and any speedup has to come from the CPU doing less work.
 That is why accounting changed. **Only nonce searches count as ASIC work** (`DEVICE_ASIC` in
 the trace, `native_hashes` in the hasher-server's `GetMetrics`):
 
-* `HashAccelerator.hash` / `hash_batch` (fingerprints, draft keys, seal digests) now always run
+* `HashAccelerator.hash` / `hash_batch` (fingerprints, seal digests) now always run
   on the host with `hashlib` and are reported as host work. Before, they were sent to the
   hasher-server and labeled ASIC. On real hardware that server runs them on the control
   board's CPU, so the label was wrong, and it cost a network round trip per draft step.

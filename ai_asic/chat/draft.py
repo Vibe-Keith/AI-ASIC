@@ -1,13 +1,14 @@
-"""Speculative-decoding drafts from a SHA-256-addressed n-gram index.
+"""Speculative-decoding drafts from an n-gram index.
 
 This is prompt-lookup decoding, extended. When the last few tokens already appeared earlier,
 the tokens that followed them are a cheap guess for what comes next; llama.cpp verifies the
 whole guess in one batched forward pass and keeps the prefix it agrees with, so good guesses
 yield several tokens per pass and wrong ones cost little.
 
-Every n-gram window (n = 1..``max_ngram``) is keyed by its SHA-256 digest - a compact context
-hash - computed in batches on the host with ``hashlib`` (a mining ASIC cannot hash arbitrary
-data, and keeping it local avoids a round trip per token).
+Every n-gram window (n = 1..``max_ngram``) is keyed by its token tuple in a Python dict. (It
+was keyed by a SHA-256 digest of the packed tokens; a dict already hashes its keys, so the extra
+digest and ``struct.pack`` per window bought nothing. A mining ASIC cannot hash arbitrary data,
+so this was host work either way.)
 
 What makes it propose better drafts than single-occurrence lookup (``mode="lookup"``):
 
@@ -36,7 +37,7 @@ with the previous draft is exactly how many draft tokens were accepted.
 """
 from __future__ import annotations
 
-import struct
+import time
 from typing import Dict, List, Sequence, Tuple
 
 from ai_asic.chat.accelerator import HashAccelerator
@@ -51,7 +52,7 @@ class HashDraftIndex:
                  len_by_match: Sequence[int] = (3, 8)):
         if mode not in MODES:
             raise ValueError(f"draft mode must be one of {MODES}, not {mode!r}")
-        self.acc = accelerator
+        self.acc = accelerator  # kept for API compatibility; the index does no device work
         self.max_ngram = max_ngram
         self.num_pred = num_pred
         self.mode = mode
@@ -61,10 +62,10 @@ class HashDraftIndex:
         self.min_agree = min_agree
         self.len_by_match = [int(x) for x in len_by_match]
         self.tokens: List[int] = []
-        self._index: Dict[bytes, List[int]] = {}   # digest -> end positions (exclusive)
-        self._by_end: Dict[int, List[bytes]] = {}  # end -> digests, ordered by n = 1..max
+        self._index: Dict[Tuple[int, ...], List[int]] = {}   # n-gram -> end positions (exclusive)
+        self._by_end: Dict[int, List[Tuple[int, ...]]] = {}  # end -> n-grams, n = 1..max
         self._refs: List[List[int]] = []
-        self._ref_index: Dict[bytes, List[Tuple[int, int]]] = {}
+        self._ref_index: Dict[Tuple[int, ...], List[Tuple[int, int]]] = {}
         self._cur_len = num_pred
         self.calls = 0
         self.proposed = 0
@@ -72,6 +73,8 @@ class HashDraftIndex:
         self.accepted = 0   # ... of which it kept
         self.candidates = 0  # candidate continuations considered across lookups
         self.ref_drafts = 0  # drafts that drew on a reference sequence
+        self.windows = 0     # n-gram windows indexed (host work, reported in the draft stage)
+        self.seconds = 0.0   # host time spent in draft calls (indexing + lookup)
         self._pending: List[int] = []
 
     def reset(self) -> None:
@@ -91,24 +94,20 @@ class HashDraftIndex:
         """Extra token sequences (e.g. retrieved past replies) to draft from this turn."""
         self._refs = [[int(t) for t in r] for r in refs if r]
         self._ref_index = {}
-        windows: List[bytes] = []
-        where: List[Tuple[int, int]] = []
+        index = self._ref_index
         for r, toks in enumerate(self._refs):
             for end in range(1, len(toks)):  # a match at the very end has no continuation
                 for size in range(1, self.max_ngram + 1):
                     if end - size < 0:
                         break
-                    windows.append(struct.pack(f"<{size}i", *toks[end - size:end]))
-                    where.append((r, end))
-        if windows:
-            for loc, digest in zip(where, self.acc.hash_batch(windows, stage="draft")):
-                self._ref_index.setdefault(digest, []).append(loc)
+                    index.setdefault(tuple(toks[end - size:end]), []).append((r, end))
 
     @property
     def references(self) -> int:
         return len(self._refs)
 
     def __call__(self, input_ids: Sequence[int]) -> List[int]:
+        t0 = time.perf_counter()
         seq = [int(t) for t in input_ids]
         n = len(self.tokens)
         pending, self._pending = self._pending, []
@@ -134,6 +133,7 @@ class HashDraftIndex:
         draft = self._lookup()
         self.proposed += len(draft)
         self._pending = draft
+        self.seconds += time.perf_counter() - t0
         return draft
 
     def _adapt(self, accepted: int, proposed: int) -> None:
@@ -144,30 +144,28 @@ class HashDraftIndex:
 
     def _truncate(self, length: int) -> None:
         for end in range(len(self.tokens), length, -1):
-            for digest in self._by_end.pop(end, []):
-                ends = self._index.get(digest)
+            for gram in self._by_end.pop(end, []):
+                ends = self._index.get(gram)
                 if ends:
                     ends.remove(end)
                     if not ends:
-                        del self._index[digest]
+                        del self._index[gram]
         del self.tokens[length:]
 
     def _extend(self, new_tokens: List[int]) -> None:
         start = len(self.tokens)
         self.tokens.extend(new_tokens)
-        windows: List[bytes] = []
-        ends: List[int] = []
-        for end in range(start + 1, len(self.tokens) + 1):
+        tokens, index, by_end = self.tokens, self._index, self._by_end
+        for end in range(start + 1, len(tokens) + 1):
+            grams = []
             for size in range(1, self.max_ngram + 1):
                 if end - size < 0:
                     break
-                windows.append(struct.pack(f"<{size}i", *self.tokens[end - size:end]))
-                ends.append(end)
-        if not windows:
-            return
-        for end, digest in zip(ends, self.acc.hash_batch(windows, stage="draft")):
-            self._index.setdefault(digest, []).append(end)
-            self._by_end.setdefault(end, []).append(digest)
+                gram = tuple(tokens[end - size:end])
+                index.setdefault(gram, []).append(end)
+                grams.append(gram)
+            by_end[end] = grams
+            self.windows += len(grams)
 
     def _candidates(self, length: int) -> List[Tuple[float, List[int], bool]]:
         """(weight, continuation, from_reference), longest match first, most recent first."""
@@ -176,15 +174,15 @@ class HashDraftIndex:
         seen = set()
         out: List[Tuple[float, List[int], bool]] = []
         for size in range(min(self.max_ngram, len(suffix)), 0, -1):
-            digest = suffix[size - 1]
+            gram = suffix[size - 1]
             w = float(size * size)
-            for end in reversed(self._index.get(digest, [])):
+            for end in reversed(self._index.get(gram, [])):
                 if end < total and ("L", end) not in seen:
                     seen.add(("L", end))
                     cont = self.tokens[end:end + length]
                     if cont:
                         out.append((w, cont, False))
-            for r, end in self._ref_index.get(digest, []):
+            for r, end in self._ref_index.get(gram, []):
                 if (r, end) not in seen:
                     seen.add((r, end))
                     cont = self._refs[r][end:end + length]
@@ -199,8 +197,8 @@ class HashDraftIndex:
         total = len(self.tokens)
         suffix = self._by_end.get(total, [])
         for size in range(min(self.max_ngram, len(suffix)), 0, -1):
-            digest = suffix[size - 1]
-            if self._ref_index.get(digest) or any(e < total for e in self._index.get(digest, ())):
+            gram = suffix[size - 1]
+            if self._ref_index.get(gram) or any(e < total for e in self._index.get(gram, ())):
                 return size
         return 0
 

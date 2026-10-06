@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 from ai_asic.hardware import bm1387
+from ai_asic.hashing import nonce_search
 from ai_asic.hardware.miner_profiles import MinerProfile, default_profile, detect_profile
 
 MAX_BATCH_SIZE = 256  # mirrors the original ComputeBatch cap
@@ -141,21 +142,14 @@ class VirtualAsicDevice(AsicDevice):
         work = bm1387.decode_work(bm1387.new_work_from_header(header, work_id=1).encode(),
                                   verify_crc=True)
         tail = bytes(work.data)
-        base = hashlib.sha256(header[:64])  # hashlib state == the frame's midstate
-        sha256 = hashlib.sha256
+        # hashlib resumed from header[:64] has exactly the frame's midstate as its state.
+        nonce, digest, tried = nonce_search.search(header, difficulty_bits, start, max_nonces)
+        if nonce is not None:
+            if _finish_double_sha_from_midstate(work.midstates[0], tail, nonce) != digest:
+                raise RuntimeError("midstate model disagrees with the nonce search")
+            return MineOutcome(nonce & _MASK, True, digest.hex(),
+                               nonce_search.leading_zero_bits(digest), tried, 0)
         end = start + max_nonces
-        tried = 0
-        for nonce in range(start, end):
-            h = base.copy()
-            h.update(tail + struct.pack("<I", nonce & _MASK))
-            digest = sha256(h.digest()).digest()
-            tried += 1
-            value = int.from_bytes(digest, "big")
-            lz = 256 - value.bit_length() if value else 256
-            if lz >= difficulty_bits:
-                if _finish_double_sha_from_midstate(work.midstates[0], tail, nonce) != digest:
-                    raise RuntimeError("midstate model disagrees with the nonce search")
-                return MineOutcome(nonce & _MASK, True, digest.hex(), lz, tried, 0)
         return MineOutcome(end & _MASK, False, (b"\x00" * 32).hex(), 0, tried, 0)
 
 

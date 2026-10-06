@@ -23,6 +23,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # With speculative drafts, llama-cpp-python keeps logits for every context position
     # (n_ctx x vocab float32: ~1.2 GB at 2048 for Qwen's 151k vocab), so keep this modest.
     "n_ctx": 2048,
+    # llama.cpp CPU settings (null = llama-cpp-python's default). n_threads: decode threads
+    # (default: half the logical cores). On a 4-vCPU VM, Qwen2.5-0.5B-shaped Q4_K_M decoded at
+    # 21.6 tok/s with the default 2 threads and 34.6 with 4; on CPUs with SMT/hyperthreading the
+    # physical core count is usually best - try both (chat --threads N). n_threads_batch: prompt
+    # threads (default: all logical cores). flash_attn: off by default, it cut decode to 17 tok/s
+    # on that VM. kv_cache_type "q8_0" halves KV-cache memory on long chats (needs flash_attn).
+    "n_threads": None,
+    "n_threads_batch": None,
+    "n_batch": 512,
+    "n_ubatch": 512,
+    "flash_attn": None,
+    "kv_cache_type": "f16",
     "max_tokens": 512,
     "temperature": 0.7,
     "use_draft": True,
@@ -70,7 +82,7 @@ Every AI file AI-ASIC uses lives here.
 |--------|----------|
 | `llm/` | GGUF language models for the chat engine (`*.gguf`). Drop any GGUF here, or run `python -m ai_asic.cli models download qwen2.5-0.5b`. |
 | `hasher/` | Trained HASHER split-models (`*.json`) saved from the Workload tab or `ai-asic workload --save`. |
-| `cache/` | `responses.json` (SHA-256-addressed response cache), `transcripts.jsonl` (chat turns sealed with mined proof-of-work) and `draft_store.jsonl` (past replies used as speculative-draft candidates). Safe to delete. |
+| `cache/` | `responses.jsonl` (SHA-256-addressed response cache, append-only), `transcripts.jsonl` (chat turns sealed with mined proof-of-work) and `draft_store.jsonl` (past replies used as speculative-draft candidates). Safe to delete. |
 | `config.json` | Chat defaults: model file, system prompt, context size, sampling, accelerator options. |
 
 Model weights and caches are git-ignored. Set the `AI_ASIC_MODELS` environment variable to
