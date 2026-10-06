@@ -14,6 +14,12 @@ Methods (mirroring the proto ``HasherService``):
   * ``GetMetrics``    -> the counters the original gathered via eBPF trace points
   * ``GetDeviceInfo`` -> device/profile capabilities
   * ``Mine``          -> native nonce search (new; the primitive the split-model ASIC layer uses)
+  * ``MineBatch``     -> up to 256 native nonce searches in one round trip (new)
+
+Only ``Mine``/``MineBatch`` are native BM1387 work. ``ComputeHash``/``ComputeBatch`` hash
+arbitrary data, which a mining chip cannot do; on a real control board they run on the board's
+CPU. ``GetMetrics`` therefore reports ``native_hashes`` (nonce-search hashes) and ``cpu_hashes``
+separately; ``total_hashes`` is their sum.
 
 Backed by any :class:`~ai_asic.server.device.AsicDevice`.
 """
@@ -39,16 +45,23 @@ class Metrics:
     total_requests: int = 0
     total_bytes: int = 0
     total_hashes: int = 0
+    native_hashes: int = 0   # nonce-search hashes (Mine / MineBatch): the chip's own work
+    cpu_hashes: int = 0      # ComputeHash / ComputeBatch: arbitrary-data SHA-256, board CPU
     error_count: int = 0
     _latency_sum_us: float = 0.0
     peak_latency_us: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def record(self, nbytes: int, nhashes: int, latency_us: float, error: bool = False) -> None:
+    def record(self, nbytes: int, nhashes: int, latency_us: float, error: bool = False,
+               native: bool = False) -> None:
         with self._lock:
             self.total_requests += 1
             self.total_bytes += nbytes
             self.total_hashes += nhashes
+            if native:
+                self.native_hashes += nhashes
+            else:
+                self.cpu_hashes += nhashes
             self._latency_sum_us += latency_us
             if latency_us > self.peak_latency_us:
                 self.peak_latency_us = latency_us
@@ -62,6 +75,8 @@ class Metrics:
                 "total_requests": self.total_requests,
                 "total_bytes": self.total_bytes,
                 "total_hashes": self.total_hashes,
+                "native_hashes": self.native_hashes,
+                "cpu_hashes": self.cpu_hashes,
                 "avg_latency_us": round(avg, 2),
                 "peak_latency_us": round(self.peak_latency_us, 2),
                 "error_count": self.error_count,
@@ -190,6 +205,8 @@ class HasherServer:
                 return self._compute_batch(params)
             if method in ("Mine", "mine"):
                 return self._mine(params)
+            if method in ("MineBatch", "mine_batch"):
+                return self._mine_batch(params)
             if method in ("GetMetrics", "get_metrics"):
                 return {"ok": True, "metrics": self.metrics.snapshot()}
             if method in ("GetDeviceInfo", "get_device_info", "info"):
@@ -228,8 +245,27 @@ class HasherServer:
         t0 = time.perf_counter()
         out = self.device.mine(header, difficulty, max_nonces=max_nonces, start=start)
         us = (time.perf_counter() - t0) * 1e6
-        self.metrics.record(80, out.hashes_tried, us)
-        return {"ok": True, "found": out.found, "nonce": out.nonce,
-                "nonce_hex": f"0x{out.nonce:08x}", "hash": out.hash_hex,
-                "leading_zeros": out.leading_zeros, "hashes_tried": out.hashes_tried,
-                "midstate_index": out.midstate_index, "latency_us": round(us, 2)}
+        self.metrics.record(80, out.hashes_tried, us, native=True)
+        return {"ok": True, **_mine_fields(out), "latency_us": round(us, 2)}
+
+    def _mine_batch(self, params: dict) -> dict:
+        jobs = []
+        for j in params.get("jobs", []):
+            jobs.append({
+                "header": bytes.fromhex(j["header"]),
+                "difficulty_bits": int(j.get("difficulty_bits", self.difficulty_bits)),
+                "max_nonces": int(j.get("max_nonces", 1 << 20)),
+                "start": int(j.get("start", 0)),
+            })
+        t0 = time.perf_counter()
+        outs = self.device.mine_batch(jobs)
+        us = (time.perf_counter() - t0) * 1e6
+        self.metrics.record(80 * len(jobs), sum(o.hashes_tried for o in outs), us, native=True)
+        return {"ok": True, "results": [_mine_fields(o) for o in outs],
+                "total_latency_us": round(us, 2)}
+
+
+def _mine_fields(out) -> dict:
+    return {"found": out.found, "nonce": out.nonce, "nonce_hex": f"0x{out.nonce:08x}",
+            "hash": out.hash_hex, "leading_zeros": out.leading_zeros,
+            "hashes_tried": out.hashes_tried, "midstate_index": out.midstate_index}

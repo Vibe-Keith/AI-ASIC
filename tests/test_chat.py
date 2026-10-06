@@ -95,13 +95,17 @@ def test_download_rejects_bad_sha256(tmp_path):
 
 # --- accelerator ------------------------------------------------------------------
 
-def test_accelerator_host_and_asic_agree(hserver):
+def test_accelerator_hashing_is_host_work_nonce_search_is_asic(hserver):
     local = HashAccelerator()
     asic = HashAccelerator("127.0.0.1", hserver.port)
-    assert local.device == DEVICE_HOST and asic.device == DEVICE_ASIC
-    data = [i.to_bytes(4, "little") for i in range(600)]  # > MAX_BATCH_SIZE, so it chunks
+    # Arbitrary-data SHA-256 is not BM1387 work: it runs (and is counted) on the host.
+    assert local.device == DEVICE_HOST and asic.device == DEVICE_HOST
+    assert local.nonce_device == DEVICE_HOST and asic.nonce_device == DEVICE_ASIC
+    data = [i.to_bytes(4, "little") for i in range(600)]
+    before = hserver.metrics.snapshot()["cpu_hashes"]
     assert asic.hash_batch(data, stage="t") == local.hash_batch(data, stage="t")
-    assert asic.meter("t").ops == 600 and asic.meter("t").calls == 1
+    assert asic.meter("t").ops == 600 and asic.meter("t").device == DEVICE_HOST
+    assert hserver.metrics.snapshot()["cpu_hashes"] == before  # no RPC for host hashing
     assert asic.hash(b"abc") == hashlib.sha256(b"abc").digest()
 
 
@@ -116,11 +120,13 @@ def test_accelerator_mine_verifies(hserver):
 
 def test_accelerator_falls_back_when_server_dies():
     srv = HasherServer(device=VirtualAsicDevice(), port=0).start()
-    acc = HashAccelerator("127.0.0.1", srv.port)
+    acc = HashAccelerator("127.0.0.1", srv.port, keep_warm=False)
     assert acc.is_hardware
     srv.stop()
-    assert acc.hash(b"still works") == hashlib.sha256(b"still works").digest()
+    out = acc.mine(prepare_asic_job([1] * 12, 0, timestamp=0), 6)
+    assert out.found and out.device == DEVICE_HOST
     assert not acc.is_hardware and "unreachable" in acc.label
+    assert acc.hash(b"still works") == hashlib.sha256(b"still works").digest()
 
 
 # --- speculative draft index -------------------------------------------------------
@@ -186,11 +192,12 @@ def test_engine_reply_and_trace(root, hserver):
     streamed = []
     r = eng.reply("What does the chip do?", on_token=streamed.append)
     assert r.text == "The chip rolls the nonce." and "".join(streamed) == r.text
+    assert r.seal and r.seal["found"]  # waits for the background seal
     stages = {s.name: s for s in r.trace.stages}
-    assert stages["fingerprint"].device == DEVICE_ASIC
+    assert stages["fingerprint"].device == DEVICE_HOST  # hashing data is not ASIC work
     assert stages["llm"].device == DEVICE_HOST
-    assert stages["seal"].device == DEVICE_ASIC
-    assert r.seal and r.seal["found"]
+    assert stages["seal"].device == DEVICE_ASIC        # the nonce search is
+    assert stages["seal"].ops == r.seal["hashes"] > 0
     assert eng.messages[-1] == {"role": "assistant", "content": r.text}
 
 
@@ -224,15 +231,16 @@ def test_bench_runs_and_summarizes(root):
 def test_engine_draft_shape_from_config(root):
     eng = ChatEngine(root=root, llm=FakeLlama(), draft_max_ngram=6, draft_num_pred=24)
     assert eng.draft.max_ngram == 6 and eng.draft.num_pred == 24
-    assert load_config(root)["draft_num_pred"] == 10  # default stays put
+    assert load_config(root)["draft_num_pred"] == 16  # default stays put
 
 
 def test_set_accelerator_closes_previous_connection(root, hserver):
     old = HashAccelerator("127.0.0.1", hserver.port)
     eng = ChatEngine(root=root, llm=FakeLlama(), accelerator=old)
-    assert old._client._sock is not None
+    client = old._client
+    assert client._sock is not None
     eng.set_accelerator(HashAccelerator())
-    assert old._client._sock is None
+    assert client._sock is None and old._client is None
 
 
 def test_engine_cache_hit_skips_llm(root):
@@ -258,6 +266,7 @@ def test_transcript_seals_verify_and_detect_tampering(root):
     eng = ChatEngine(root=root, llm=FakeLlama("ok"), seal_difficulty=8, use_cache=False)
     eng.reply("one")
     eng.reply("two")
+    eng.flush()  # seals are mined in the background
     log = root / "cache" / "transcripts.jsonl"
     ok, n, problems = verify_transcripts(log)
     assert ok and n == 2 and not problems

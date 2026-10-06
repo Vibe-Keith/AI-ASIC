@@ -10,8 +10,9 @@ import json
 import socket
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ai_asic.server.device import MAX_BATCH_SIZE
 from ai_asic.server.hasher_server import DEFAULT_PORT
 
 
@@ -37,6 +38,7 @@ class HasherClient:
         self.timeout = timeout
         self._sock: Optional[socket.socket] = None
         self._lock = threading.Lock()
+        self._batch_supported = True
 
     def close(self) -> None:
         with self._lock:
@@ -124,10 +126,37 @@ class HasherClient:
             "header": header.hex(), "difficulty_bits": difficulty_bits,
             "max_nonces": max_nonces, "start": start,
         })
-        return RemoteMineResult(
-            found=bool(resp["found"]), nonce=int(resp["nonce"]),
-            hash_hex=str(resp["hash"]), leading_zeros=int(resp["leading_zeros"]),
-            hashes_tried=int(resp["hashes_tried"]),
-            midstate_index=int(resp.get("midstate_index", 0)),
-            latency_us=float(resp.get("latency_us", 0.0)),
-        )
+        return _mine_result(resp)
+
+    def mine_batch(self, jobs: Sequence[Tuple[bytes, int, int]]) -> List[RemoteMineResult]:
+        """Native nonce searches for ``(header, difficulty_bits, max_nonces)`` jobs in one round
+        trip (``MineBatch``). Falls back to one ``Mine`` per job against a server that predates
+        ``MineBatch``."""
+        if not jobs:
+            return []
+        if len(jobs) > MAX_BATCH_SIZE:
+            out: List[RemoteMineResult] = []
+            for i in range(0, len(jobs), MAX_BATCH_SIZE):
+                out.extend(self.mine_batch(jobs[i:i + MAX_BATCH_SIZE]))
+            return out
+        if self._batch_supported:
+            try:
+                resp = self._rpc("MineBatch", {"jobs": [
+                    {"header": h.hex(), "difficulty_bits": int(b), "max_nonces": int(n)}
+                    for h, b, n in jobs]})
+                return [_mine_result(r) for r in resp["results"]]
+            except RuntimeError as exc:
+                if "unknown method" not in str(exc):
+                    raise
+                self._batch_supported = False
+        return [self.mine(h, int(b), max_nonces=int(n)) for h, b, n in jobs]
+
+
+def _mine_result(resp: Dict[str, Any]) -> RemoteMineResult:
+    return RemoteMineResult(
+        found=bool(resp["found"]), nonce=int(resp["nonce"]),
+        hash_hex=str(resp["hash"]), leading_zeros=int(resp["leading_zeros"]),
+        hashes_tried=int(resp["hashes_tried"]),
+        midstate_index=int(resp.get("midstate_index", 0)),
+        latency_us=float(resp.get("latency_us", 0.0)),
+    )

@@ -162,6 +162,8 @@ def test_engine_seals_on_miner_and_verifies(root, pool):
                          use_cache=False)
         r1 = eng.reply("one")
         eng.reply("two")
+        eng.flush()  # seals run in the background; finish them while the miner is attached
+    assert r1.seal["kind"] == "stratum"
     stages = {s.name: s for s in r1.trace.stages}
     assert stages["seal"].device == DEVICE_ASIC
     assert stages["fingerprint"].device == DEVICE_HOST  # miners only hash block headers

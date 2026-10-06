@@ -26,14 +26,39 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_tokens": 512,
     "temperature": 0.7,
     "use_draft": True,
-    # Prompt-lookup draft shape: longest n-gram matched against the context, and the most
-    # tokens proposed per lookup. Longer drafts make each CPU verification pass costlier and
-    # their tail is accepted less often, so tune these on your own prompts.
-    "draft_max_ngram": 3,
-    "draft_num_pred": 10,
+    # Speculative drafts (see ai_asic/chat/draft.py). Shape: longest context n-gram matched and
+    # the most tokens proposed per verification pass. "consensus" pools every earlier occurrence
+    # (and retrieved past replies) and stops where they disagree; "lookup" is the old
+    # single-occurrence behaviour. draft_len_by_match caps drafts backed by 1- and 2-token
+    # matches, where most rejected (wasted) draft tokens come from.
+    "draft_max_ngram": 4,
+    "draft_num_pred": 16,
+    "draft_mode": "consensus",
+    "draft_len_by_match": [3, 8],
+    "draft_max_candidates": 8,
+    "draft_adaptive": False,
+    # Retrieval drafts: past replies to similar prompts (matched by ASIC LSH buckets) become
+    # extra draft candidates. Stored in cache/draft_store.jsonl.
+    "draft_retrieval": True,
+    "draft_retrieval_k": 2,
+    "draft_retrieval_min_sim": 0.65,
+    # KV-block routing (ai_asic/chat/routing.py): once the prompt would exceed
+    # route_budget_tokens, keep the system prompt, the newest exchanges and the older exchanges
+    # whose ASIC LSH buckets match the new message, so the CPU attends over less context.
+    "route_context": True,
+    "route_budget_tokens": 768,
+    "route_keep_recent": 2,
+    "route_low_water": 0.6,       # a compaction keeps this fraction of the budget
+    "route_recall_sim": 0.8,      # re-admit a dropped exchange this similar to the new message
+    # LSH bucket IDs by native BM1387 nonce search (ai_asic/chat/lsh.py).
+    "lsh_bands": 10,
+    "lsh_band_bits": 6,
+    "bucket_difficulty": 6,
+    "bucket_max_nonces": 4096,
     "use_cache": True,
     "seal_difficulty": 10,
     "seal_timeout": 30,  # seconds to wait for a real miner's share before sealing on the host
+    "seal_async": True,  # seal in the background; the reply returns without waiting for it
 }
 
 _README = """\
@@ -45,7 +70,7 @@ Every AI file AI-ASIC uses lives here.
 |--------|----------|
 | `llm/` | GGUF language models for the chat engine (`*.gguf`). Drop any GGUF here, or run `python -m ai_asic.cli models download qwen2.5-0.5b`. |
 | `hasher/` | Trained HASHER split-models (`*.json`) saved from the Workload tab or `ai-asic workload --save`. |
-| `cache/` | `responses.json` (SHA-256-addressed response cache) and `transcripts.jsonl` (chat turns sealed with mined proof-of-work). Safe to delete. |
+| `cache/` | `responses.json` (SHA-256-addressed response cache), `transcripts.jsonl` (chat turns sealed with mined proof-of-work) and `draft_store.jsonl` (past replies used as speculative-draft candidates). Safe to delete. |
 | `config.json` | Chat defaults: model file, system prompt, context size, sampling, accelerator options. |
 
 Model weights and caches are git-ignored. Set the `AI_ASIC_MODELS` environment variable to

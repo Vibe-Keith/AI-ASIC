@@ -66,6 +66,15 @@ class AsicDevice(ABC):
         """Native nonce search: find a nonce whose double-SHA-256 of ``header`` has at least
         ``difficulty_bits`` leading zero bits."""
 
+    def mine_batch(self, jobs: Sequence[dict]) -> List[MineOutcome]:
+        """Several native nonce searches in one request. Each job is a dict with ``header``
+        (bytes) and optional ``difficulty_bits``, ``max_nonces``, ``start``."""
+        if len(jobs) > MAX_BATCH_SIZE:
+            raise ValueError(f"batch exceeds {MAX_BATCH_SIZE}")
+        return [self.mine(j["header"], int(j.get("difficulty_bits", 16)),
+                          max_nonces=int(j.get("max_nonces", 1 << 20)),
+                          start=int(j.get("start", 0))) for j in jobs]
+
     def info(self) -> dict:
         p = self.profile
         return {
@@ -79,11 +88,20 @@ class AsicDevice(ABC):
 
 
 class VirtualAsicDevice(AsicDevice):
-    """The simulated BM1387 chip. SHA-256 cores are modeled with ``hashlib``; the nonce
-    search uses the cycle-honest :class:`~ai_asic.hardware.simulator.VirtualBM1387`."""
+    """The simulated BM1387 chip.
 
-    def __init__(self, model: str = "Antminer S9"):
+    ``mine`` takes the work exactly as the chip does - a CRC-checked BM1387 chain frame
+    carrying only the midstate and the 12-byte tail - and rolls the nonce from that midstate.
+    By default the roll uses ``hashlib`` resumed from the midstate (``fast=True``), and the
+    winning nonce is then re-derived through the cycle-honest midstate-only model
+    (:func:`~ai_asic.hardware.simulator._finish_double_sha_from_midstate`); a mismatch raises.
+    Results are identical to the pure-Python model (same first nonce, same hash, same count)
+    at a few hundred times the speed. ``fast=False`` rolls every nonce through the model.
+    """
+
+    def __init__(self, model: str = "Antminer S9", fast: bool = True):
         self.profile = detect_profile(model) or default_profile()
+        self.fast = fast
 
     @property
     def available(self) -> bool:
@@ -101,6 +119,8 @@ class VirtualAsicDevice(AsicDevice):
 
         if len(header) != 80:
             raise ValueError("header must be 80 bytes")
+        if self.fast:
+            return self._mine_fast(header, difficulty_bits, max_nonces, start)
         cfg = SimConfig(
             difficulty_bits=difficulty_bits,
             chip_count=self.profile.chip_count or 63,
@@ -112,6 +132,31 @@ class VirtualAsicDevice(AsicDevice):
         r = chip.mine()
         return MineOutcome(r.nonce, r.found, r.hash_hex, r.leading_zeros,
                            r.hashes_tried, r.midstate_index)
+
+    def _mine_fast(self, header: bytes, difficulty_bits: int, max_nonces: int,
+                   start: int) -> MineOutcome:
+        from ai_asic.hardware.simulator import _finish_double_sha_from_midstate
+
+        # The chip's view of the work: a CRC-checked frame with the midstate and 12-byte tail.
+        work = bm1387.decode_work(bm1387.new_work_from_header(header, work_id=1).encode(),
+                                  verify_crc=True)
+        tail = bytes(work.data)
+        base = hashlib.sha256(header[:64])  # hashlib state == the frame's midstate
+        sha256 = hashlib.sha256
+        end = start + max_nonces
+        tried = 0
+        for nonce in range(start, end):
+            h = base.copy()
+            h.update(tail + struct.pack("<I", nonce & _MASK))
+            digest = sha256(h.digest()).digest()
+            tried += 1
+            value = int.from_bytes(digest, "big")
+            lz = 256 - value.bit_length() if value else 256
+            if lz >= difficulty_bits:
+                if _finish_double_sha_from_midstate(work.midstates[0], tail, nonce) != digest:
+                    raise RuntimeError("midstate model disagrees with the nonce search")
+                return MineOutcome(nonce & _MASK, True, digest.hex(), lz, tried, 0)
+        return MineOutcome(end & _MASK, False, (b"\x00" * 32).hex(), 0, tried, 0)
 
 
 class ChainAsicDevice(AsicDevice):

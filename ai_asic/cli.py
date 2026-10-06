@@ -163,10 +163,15 @@ def _check(ok: bool) -> str:
     return "OK" if ok else "MISMATCH"
 
 
-def _print_trace(trace) -> None:
-    print(f"    {'Stage':<12}{'Device':<10}{'Ops':>7}{'Time':>11}  Detail")
-    for s in trace.stages:
-        print(f"    {s.name:<12}{s.device:<10}{s.ops:>7}{_fmt_duration(s.seconds):>11}  {s.detail}")
+def _print_trace(trace, seal_pending: bool = False) -> None:
+    print(f"    {'Stage':<14}{'Device':<10}{'Ops':>9}{'Time':>11}  Detail")
+    for s in list(trace.stages):
+        print(f"    {s.name:<14}{s.device:<10}{s.ops:>9}{_fmt_duration(s.seconds):>11}  {s.detail}")
+    if seal_pending:
+        print(f"    {'seal':<14}{'':<10}{'':>9}{'':>11}  mining in the background")
+    print(f"    host ops {trace.host_ops} ({_fmt_duration(trace.host_seconds)}), "
+          f"ASIC ops {trace.asic_ops} ({_fmt_duration(trace.asic_seconds)}) - "
+          "ASIC ops are native nonce-search hashes only")
 
 
 def _cmd_models(args: argparse.Namespace) -> int:
@@ -255,7 +260,15 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         overrides["draft_max_ngram"] = args.draft_ngram
     if args.draft_tokens is not None:
         overrides["draft_num_pred"] = args.draft_tokens
-    engine =ChatEngine(args.model, accelerator=acc, **overrides)
+    if args.draft_mode is not None:
+        overrides["draft_mode"] = args.draft_mode
+    if args.no_retrieval:
+        overrides["draft_retrieval"] = False
+    if args.no_route:
+        overrides["route_context"] = False
+    if args.route_budget is not None:
+        overrides["route_budget_tokens"] = args.route_budget
+    engine = ChatEngine(args.model, accelerator=acc, **overrides)
 
     print(f"Model:        {engine.model_name}")
     print(f"Accelerator:  {acc.label}")
@@ -270,10 +283,19 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         result = engine.reply(text, on_token=lambda t: print(t, end="", flush=True))
         print()
         if args.trace or args.once:
-            _print_trace(result.trace)
+            if args.once:
+                result.wait_seal()
+            pending = result.seal_future is not None and not result.seal_future.done()
+            _print_trace(result.trace, seal_pending=pending)
+            ev = result.eval
+            if ev is not None:
+                print(f"    {ev.tokens_per_pass:.2f} accepted tokens per verification pass, "
+                      f"{ev.attention_pairs:,} attention pairs, {ev.rejected_tokens} unused "
+                      "draft tokens")
 
     if args.once:
         turn(args.once)
+        engine.flush()
         return 0
 
     print("Type a message. Commands: /new (fresh chat), /trace (toggle stage trace), /quit")
@@ -282,10 +304,12 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             text = input("you> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            engine.flush()
             return 0
         if not text:
             continue
         if text in ("/quit", "/exit"):
+            engine.flush()
             return 0
         if text == "/new":
             engine.new_chat()
@@ -403,29 +427,49 @@ def _cmd_hwtest(args: argparse.Namespace) -> int:
 
 
 def _cmd_bench(args: argparse.Namespace) -> int:
+    from ai_asic.chat import bench as B
     from ai_asic.chat.accelerator import HashAccelerator
-    from ai_asic.chat.bench import (ROW_HEADER, format_row, format_summary, parse_configs,
-                                    run_bench, summarize)
 
+    acc = HashAccelerator() if args.no_asic else HashAccelerator(args.host, args.port)
+    make_llm = B.sim_llm_factory() if args.sim else None
+    print(f"Accelerator:  {acc.label}")
+    if args.sim:
+        print("Model:        weightless stand-in (--sim): llama-cpp-python's decode loop with "
+              "scripted replies.\n              Counts are real mechanics; speed and acceptance "
+              "on real text need a GGUF model.")
     try:
-        configs = parse_configs(args.configs)
+        if args.suite == "route":
+            budgets = [None if b.strip().lower() in ("off", "full") else int(b)
+                       for b in args.budgets.split(",") if b.strip()]
+            print(f"Suite:        routing (live chat), budgets {args.budgets}, "
+                  f"max_tokens {args.max_tokens}, greedy")
+            print()
+            print(B.ROUTE_HEADER)
+            rows = B.run_route_bench(args.model, budgets, max_tokens=args.max_tokens,
+                                     accelerator=acc, make_llm=make_llm,
+                                     on_row=lambda r: print(B.format_route_row(r), flush=True))
+            print()
+            for line in B.format_route_summary(B.summarize_route(rows)):
+                print(line)
+            return 0
+        configs = B.parse_configs(args.configs)
+        print(f"Suite:        drafts, configs {args.configs}, max_tokens {args.max_tokens}, "
+              f"runs {args.runs}, greedy")
+        print()
+        print(B.ROW_HEADER)
+        rows = B.run_bench(args.model, configs, max_tokens=args.max_tokens, runs=args.runs,
+                           accelerator=acc, make_llm=make_llm,
+                           on_row=lambda r: print(B.format_row(r), flush=True))
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    acc = HashAccelerator() if args.no_asic else HashAccelerator(args.host, args.port)
-    print(f"Accelerator:  {acc.label}")
-    print(f"Configs:      {args.configs}   max_tokens {args.max_tokens}, runs {args.runs}, "
-          "greedy")
-    print()
-    print(ROW_HEADER)
-    try:
-        rows = run_bench(args.model, configs, max_tokens=args.max_tokens, runs=args.runs,
-                         accelerator=acc, on_row=lambda r: print(format_row(r), flush=True))
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    finally:
+        acc.close()
     print()
-    for line in format_summary(summarize(rows)):
+    for line in B.format_summary(B.summarize(rows)):
         print(line)
     return 0
 
@@ -443,7 +487,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     print(f"hasher-server:     {device.name()}")
     print(f"device available:  {device.available}")
     print(f"listening on:      {args.host}:{srv.port}  (difficulty {args.difficulty} bits)")
-    print("Methods: ComputeHash, ComputeBatch, Mine, GetMetrics, GetDeviceInfo. Ctrl+C to stop.")
+    print("Methods: ComputeHash, ComputeBatch, Mine, MineBatch, GetMetrics, GetDeviceInfo. "
+          "Ctrl+C to stop.")
     try:
         while True:
             time.sleep(1)
@@ -602,18 +647,27 @@ def build_parser() -> argparse.ArgumentParser:
     md.add_argument("name", nargs="?", default=None, help="model to download (e.g. qwen2.5-0.5b)")
     md.set_defaults(func=_cmd_models)
 
-    ch = sub.add_parser("chat", help="chat with a local LLM, SHA-256 stages on the ASIC")
+    ch = sub.add_parser("chat", help="chat with a local LLM; native nonce search on the ASIC")
     ch.add_argument("--model", default=None, help="GGUF file name in ai_models/llm/ or a path")
     ch.add_argument("--once", default=None, help="send one message, print the reply, exit")
     ch.add_argument("--host", default="127.0.0.1", help="hasher-server host (the ASIC)")
     ch.add_argument("--port", type=int, default=HASHER_PORT,
                     help=f"hasher-server port (default {HASHER_PORT})")
-    ch.add_argument("--no-asic", action="store_true", help="do the SHA-256 stages on the host")
+    ch.add_argument("--no-asic", action="store_true",
+                    help="run the nonce searches (LSH buckets, seals) on the host")
     ch.add_argument("--no-draft", action="store_true", help="disable speculative drafts")
     ch.add_argument("--draft-ngram", type=int, default=None,
-                    help="longest context n-gram the draft index matches (default 3)")
+                    help="longest context n-gram the draft index matches (default 4)")
     ch.add_argument("--draft-tokens", type=int, default=None,
-                    help="most tokens proposed per draft lookup (default 10)")
+                    help="most tokens proposed per verification pass (default 16)")
+    ch.add_argument("--draft-mode", choices=("consensus", "lookup"), default=None,
+                    help="consensus over all earlier occurrences (default) or single lookup")
+    ch.add_argument("--no-retrieval", action="store_true",
+                    help="do not draft from past replies to similar prompts")
+    ch.add_argument("--no-route", action="store_true",
+                    help="disable KV-block routing (attend over the whole history)")
+    ch.add_argument("--route-budget", type=int, default=None,
+                    help="prompt tokens before routing compacts the history (default 768)")
     ch.add_argument("--no-cache", action="store_true", help="disable the response cache")
     ch.add_argument("--seal-difficulty", type=int, default=None,
                     help="transcript seal difficulty in bits (0 disables sealing)")
@@ -643,16 +697,27 @@ def build_parser() -> argparse.ArgumentParser:
     _add_pool_args(hw)
     hw.set_defaults(func=_cmd_hwtest)
 
-    bn = sub.add_parser("bench", help="compare chat speed with speculative drafts off and on")
+    bn = sub.add_parser("bench",
+                        help="measure tokens per verification pass and CPU attention work")
+    bn.add_argument("--suite", choices=("draft", "route"), default="draft",
+                    help="draft: speculative-draft configs; route: KV-block routing in a "
+                         "long live chat")
     bn.add_argument("--model", default=None, help="GGUF file name in ai_models/llm/ or a path")
-    bn.add_argument("--configs", default="off,3x10",
-                    help="comma list: 'off' or NGRAMxTOKENS draft shapes (default off,3x10)")
+    bn.add_argument("--sim", action="store_true",
+                    help="use the weightless stand-in model (no GGUF or llama-cpp-python)")
+    bn.add_argument("--configs", default="off,3x10l,4x16",
+                    help="draft suite: comma list of 'off' or NGRAMxTOKENS[l][r] "
+                         "(l = legacy single lookup, r = retrieval drafts); default "
+                         "off,3x10l,4x16")
+    bn.add_argument("--budgets", default="off,768,512",
+                    help="route suite: comma list of 'off' or token budgets "
+                         "(default off,768,512)")
     bn.add_argument("--max-tokens", type=int, default=128)
     bn.add_argument("--runs", type=int, default=1, help="passes over the prompt set")
     bn.add_argument("--host", default="127.0.0.1", help="hasher-server host (the ASIC)")
     bn.add_argument("--port", type=int, default=HASHER_PORT,
                     help=f"hasher-server port (default {HASHER_PORT})")
-    bn.add_argument("--no-asic", action="store_true", help="do the draft hashing on the host")
+    bn.add_argument("--no-asic", action="store_true", help="run the nonce searches on the host")
     bn.set_defaults(func=_cmd_bench)
 
     return p

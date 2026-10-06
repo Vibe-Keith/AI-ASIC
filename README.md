@@ -70,7 +70,7 @@ python -m ai_asic.cli simulate --difficulty 16 --model "Antminer S9"
 # Run an AI workload split across the host CPU and the ASIC miner
 python -m ai_asic.cli workload "optical alignment with AI" --difficulty 12
 
-# Chat with a local LLM; its SHA-256 stages run on the ASIC (see "Chatbot" below)
+# Chat with a local LLM: CPU runs the model, the ASIC does native nonce search (see "Chatbot")
 python -m ai_asic.cli models download qwen2.5-0.5b
 python -m ai_asic.cli chat
 ```
@@ -261,30 +261,59 @@ miner's own control board) and the virtual chip otherwise, so the exact same ser
 and the exact same split-model - runs on real hardware or on a laptop with no code change. In
 the GUI, the Simulate tab starts this hasher-server automatically alongside the cgminer API.
 
-## Chatbot: local LLM with the ASIC as a SHA-256 accelerator
+## Chatbot: local LLM, CPU decoding, ASIC nonce search
 
-`ai_asic/chat/` adds a real chatbot. The ASIC is used the way a GPU is used for matrix maths:
-as a co-processor for the one class of operation it is built for. A SHA-256 ASIC **cannot** run
-a language model's neural network (matrix multiplies, attention, sampling), so that runs on the
-CPU through llama.cpp. Every stage of the pipeline that *is* SHA-256 work goes to the ASIC:
+`ai_asic/chat/` adds a real chatbot. A SHA-256 mining ASIC **cannot** run a language model's
+neural network (matrix multiplies, attention, sampling), so llama.cpp runs it on the CPU. What
+this project optimizes is how much work the CPU has to do per reply, and it uses the ASIC for
+the one operation a BM1387 natively performs: **nonce search** over an 80-byte header.
 
 | Stage | Device | What it does |
 |-------|--------|--------------|
-| fingerprint | **ASIC** | SHA-256 content address of (model, conversation, sampling) → response cache. An exact repeat is answered without running the LLM. |
-| llm | **CPU** | tokenize, forward passes, draft verification, sampling (llama.cpp) |
-| draft | **ASIC** | SHA-256-keyed n-gram index proposing speculative tokens ("prompt lookup decoding"); llama.cpp verifies a whole draft in one batched pass |
-| seal | **ASIC** | mines a proof-of-work nonce over each turn's chained transcript digest → tamper-evident log |
+| fingerprint | host | SHA-256 content address of (model, conversation, sampling) → response cache; an exact repeat is answered without running the LLM |
+| route.buckets | **ASIC** | LSH bucket IDs for the new message (and any history exchange not yet bucketed) by native nonce search: one batched request, mostly cache hits |
+| route | host | **KV-block routing**: once the prompt outgrows a budget, keep the newest exchanges plus the old ones whose buckets match the new message, so the CPU attends over a shorter context |
+| retrieve | host | past replies to similar prompts (found by bucket) become extra draft candidates |
+| llm | host | llama.cpp prefill, verification passes, sampling - with exact counts of verification passes and attention work |
+| draft | host | speculative drafts: n-gram index (SHA-256 keys, `hashlib`) with consensus over every earlier occurrence and length capped by match strength |
+| seal | **ASIC** | proof-of-work nonce over each turn's chained transcript digest, mined in the background → tamper-evident log |
 
-The ASIC stages go to the on-device **hasher-server** when one is reachable, and fall back to
-`hashlib` on the host otherwise. Every reply prints which device actually ran each stage:
+**Only nonce searches are counted as ASIC work.** Hashing arbitrary data (fingerprints, draft
+keys, digests) is not something a mining chip can do, so it runs on the host and the trace says
+so; it also costs no network round trip. Nonce searches are asynchronous and batched (one
+`MineBatch` request per group, never one per token), and the accelerator keeps the device path
+warm with a tiny search while idle. Every reply prints the device that ran each stage and the two
+numbers that predict real speed on a CPU: **accepted tokens per verification pass** and
+**attention pairs** (query-key work per layer and head, including draft tokens evaluated and not
+kept):
 
 ```
-Accelerator: ASIC via hasher-server @ 127.0.0.1:8888 (BM1387)
-Stage       Device        Ops  Time (ms)  Detail
-fingerprint asic            1        1.0  065d448b16cbedb6... cache miss
-llm         host-cpu        9      251.5  9 tokens, 26.9 tok/s (forward passes, verify, sample)
-draft       asic          129       83.0  9 lookups, 7 tokens proposed, 9 hash batches
-seal        asic          371      125.6  nonce 0x00000171 at 10 bits
+Accelerator: ASIC via hasher-server @ 127.0.0.1:45699 (BM1387); nonce search on the ASIC, other hashing on host CPU
+Verification passes: 3   accepted tokens/pass: 9.33   attention pairs: 3,741   unused draft tokens: 10
+Stage         Device          Ops  Time (ms)  Detail
+fingerprint   host-cpu          1        0.1  b1dbffd16f5c8fb8... cache miss
+route.buckets asic            684        9.5  10 nonce searches in 1 round trip(s), 0 cached (LSH bucket IDs)
+route         host-cpu          0        1.0  fits budget; 55 prompt tokens
+retrieve      host-cpu          0        0.0  no similar past reply (0 stored)
+llm           host-cpu         28        0.6  28 tokens, ...; 3 verification passes, 86 tokens evaluated (0 KV reused), 3,741 attention pairs
+draft         host-cpu        274        0.1  3 lookups, 35 proposed from 3 candidates, 19/19 accepted (100%), 9.33 tok/pass, 10 unused draft tokens
+seal          asic            910        4.6  nonce 0x0000038d at 10 bits (background)
+```
+
+(That trace is from the weightless stand-in model, so its speeds are meaningless; the counts are
+real.) Design, measurements and limits: [`docs/ASIC_DECODING.md`](docs/ASIC_DECODING.md).
+
+### Measure it on your machine
+
+```bash
+# Speculative drafts: off vs the old single lookup (3x10l) vs the new default (4x16)
+python -m ai_asic.cli bench --model qwen2.5-0.5b-instruct-q4_k_m.gguf --runs 2
+
+# KV-block routing in a long live chat: full history vs routed at two budgets
+python -m ai_asic.cli bench --suite route --budgets off,768,512
+
+# Either suite without a model or llama-cpp-python (stand-in; counts only)
+python -m ai_asic.cli bench --sim
 ```
 
 ### Setup
@@ -308,7 +337,9 @@ python -m ai_asic.cli chat --verify                  # re-check every transcript
 ```
 
 In the GUI, open the **Chat** tab. Start the virtual miner on the Simulate tab first if you want
-the SHA-256 stages on the ASIC; otherwise they run on the host.
+the nonce searches (LSH buckets, seals) on the ASIC; otherwise they run on the host. The **KV
+routing** checkbox turns context routing on or off. Useful chat flags: `--no-route`,
+`--route-budget N`, `--draft-mode lookup`, `--no-retrieval`.
 
 ### Real hardware (closed loop, no outside servers)
 
@@ -342,10 +373,11 @@ S9) trades seal latency against share traffic.
 
 ```
 ai_models/
-  config.json   chat defaults: model, system prompt, n_ctx, sampling, draft/cache/seal options
+  config.json   chat defaults: model, system prompt, n_ctx, sampling, draft/routing/cache/seal options
   llm/          GGUF language models (*.gguf)
   hasher/       trained HASHER split-models (*.json) - the Workload tab saves here
-  cache/        responses.json (response cache), transcripts.jsonl (sealed chat log)
+  cache/        responses.json (response cache), transcripts.jsonl (sealed chat log),
+                draft_store.jsonl (past replies used as draft candidates)
 ```
 
 Weights and caches are git-ignored. Set `AI_ASIC_MODELS` to keep the folder elsewhere (for
@@ -353,14 +385,18 @@ example off a synced drive; model files are hundreds of MB).
 
 ### What to expect (measured on this machine, Qwen2.5-0.5B Q4_K_M)
 
+These numbers were measured before the draft and routing changes described in
+[`docs/ASIC_DECODING.md`](docs/ASIC_DECODING.md); re-run `bench` to see the current ones.
+
 - **Drafts help when a reply repeats its context**: 122 tok/s with drafts against about 91 without
   on a quoting prompt. They cost speed when there is nothing to look up (41 vs 59 tok/s on a
   first turn). Turn them off with `--no-draft` or the checkbox.
 - **Memory**: about 550 MB peak working set without drafts, about 730 MB with them (llama-cpp-python
   keeps per-position logits when a draft model is attached, which is why `n_ctx` defaults to 2048).
 - **Cache hits** answer in about 1 ms instead of a full generation.
-- **Seals** on the virtual chip take about 100-400 ms per turn (pure-Python SHA-256); on the host
-  about 1 ms. `--seal-difficulty 0` disables them.
+- **Seals** now run in the background and no longer delay the reply. The virtual chip searches
+  with `hashlib` from the midstate and confirms each winning nonce with the cycle-honest model,
+  so a seal takes a few ms. `--seal-difficulty 0` disables them.
 - **Quality** is that of a 0.5B model: fluent, but often wrong on facts. Drop a larger instruct
   GGUF (1-3B) into `ai_models/llm/` and pick it in the Chat tab or with `--model` for better answers.
 
@@ -373,7 +409,7 @@ example off a synced drive; model files are hundreds of MB).
 | Virtual BM1387 chip simulator | ✅ new | `ai_asic/hardware/simulator.py` |
 | On-device hasher-server (was MIPS/gRPC) | ✅ ported | `ai_asic/server/` |
 | Host/ASIC split workload (model) | ✅ new | `ai_asic/workloads/split_model.py` |
-| Chatbot (local LLM + ASIC SHA-256 accelerator) | ✅ new | `ai_asic/chat/`, `ai_models/` |
+| Chatbot (local LLM, speculative drafts, KV routing, ASIC nonce search) | ✅ new | `ai_asic/chat/`, `ai_models/` |
 | Bitcoin header construction | ✅ ported | `ai_asic/hardware/bitcoin_header.py` |
 | Device detection | ✅ ported | `ai_asic/hardware/device_detector.py` |
 | cgminer/bmminer client | ✅ ported | `ai_asic/cgminer/client.py` |

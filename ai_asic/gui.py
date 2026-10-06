@@ -8,8 +8,8 @@ the CLI:
                Detect tab and the Infer ASIC backend find it like real hardware.
   * Workload-- run a hash-based classifier split across the host CPU (encoder + head)
                and the ASIC miner (the nonce-search mining layer); load/save models.
-  * Chat    -- chat with a local GGUF LLM (CPU); its SHA-256 stages - response-cache
-               fingerprints, speculative-draft index, transcript seals - run on the ASIC.
+  * Chat    -- chat with a local GGUF LLM (CPU) with speculative drafts and KV-block
+               routing; the ASIC does the native nonce searches (LSH buckets, seals).
   * Profiles-- browse every supported miner model in a sortable table.
   * Infer   -- run recursive inference on text (software or cgminer ASIC backend).
   * Encode  -- build a BM1387 (S9) work frame from an 80-byte header.
@@ -81,6 +81,8 @@ class AIASICApp:
         # draft setting changes (drafts are fixed when llama.cpp loads the model).
         self._chat_engine = None
         self._chat_engine_key = None
+        self._chat_acc = None       # kept across turns so the ASIC path stays warm
+        self._chat_acc_port = None
 
         self._build_menu()
 
@@ -461,12 +463,15 @@ class AIASICApp:
         self.chat_asic = tk.BooleanVar(value=True)
         self.chat_draft = tk.BooleanVar(value=bool(cfg["use_draft"]))
         self.chat_cache = tk.BooleanVar(value=bool(cfg["use_cache"]))
-        ttk.Checkbutton(opts, text="ASIC accelerator (hasher-server, Simulate tab)",
+        self.chat_route = tk.BooleanVar(value=bool(cfg["route_context"]))
+        ttk.Checkbutton(opts, text="ASIC nonce search (hasher-server, Simulate tab)",
                         variable=self.chat_asic).pack(side="left")
         ttk.Checkbutton(opts, text="Speculative drafts",
                         variable=self.chat_draft).pack(side="left", padx=(10, 0))
         ttk.Checkbutton(opts, text="Response cache",
                         variable=self.chat_cache).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(opts, text="KV routing",
+                        variable=self.chat_route).pack(side="left", padx=(10, 0))
 
         frame = ttk.Frame(tab)
         frame.pack(fill="both", expand=True, pady=(6, 0))
@@ -514,6 +519,11 @@ class AIASICApp:
         self.chat_log.see("end")
         self.chat_log.configure(state="disabled")
 
+    def _append_trace(self, text: str) -> None:
+        self.chat_trace.configure(state="normal")
+        self.chat_trace.insert("end", text)
+        self.chat_trace.configure(state="disabled")
+
     def _chat_new(self) -> None:
         if self._chat_engine is not None:
             self._chat_engine.new_chat()
@@ -539,13 +549,18 @@ class AIASICApp:
 
         use_draft = bool(self.chat_draft.get())
         use_cache = bool(self.chat_cache.get())
+        use_route = bool(self.chat_route.get())
         hport = self._hserver.port if (self.chat_asic.get() and self._hserver) else None
         asic_requested = bool(self.chat_asic.get())
 
         def work() -> str:
             from ai_asic.chat.engine import ChatEngine
 
-            acc = HashAccelerator("127.0.0.1", hport) if hport else HashAccelerator()
+            if self._chat_acc is None or self._chat_acc_port != hport:
+                self._chat_acc = (HashAccelerator("127.0.0.1", hport) if hport
+                                  else HashAccelerator())
+                self._chat_acc_port = hport
+            acc = self._chat_acc
             key = (model, use_draft)
             if self._chat_engine is None or self._chat_engine_key != key:
                 history = self._chat_engine.messages if self._chat_engine else None
@@ -558,16 +573,36 @@ class AIASICApp:
             engine = self._chat_engine
             engine.set_accelerator(acc)
             engine.cfg["use_cache"] = use_cache
+            engine.cfg["route_context"] = use_route
             self._jobs.put(lambda: self.status.set("Generating..."))
             result = engine.reply(
                 text, on_token=lambda t: self._jobs.put(lambda t=t: self._chat_write(t, "bot")))
             lines = [f"Accelerator: {result.trace.asic_label}"
                      + ("   (start the virtual miner on the Simulate tab to offload)"
                         if asic_requested and not hport else "")]
-            lines.append(f"{'Stage':<12}{'Device':<10}{'Ops':>7}{'Time (ms)':>11}  Detail")
-            for s in result.trace.stages:
-                lines.append(f"{s.name:<12}{s.device:<10}{s.ops:>7}"
+            ev = result.eval
+            if ev is not None:
+                lines.append(f"Verification passes: {ev.decode_passes}   accepted tokens/pass: "
+                             f"{ev.tokens_per_pass:.2f}   attention pairs: "
+                             f"{ev.attention_pairs:,}   unused draft tokens: "
+                             f"{ev.rejected_tokens}")
+            lines.append(f"{'Stage':<14}{'Device':<10}{'Ops':>9}{'Time (ms)':>11}  Detail")
+            for s in list(result.trace.stages):
+                lines.append(f"{s.name:<14}{s.device:<10}{s.ops:>9}"
                              f"{s.seconds * 1000:>11.1f}  {s.detail}")
+            fut = result.seal_future
+            if fut is not None and not fut.done():
+                lines.append(f"{'seal':<14}{'':<10}{'':>9}{'':>11}  mining in the background...")
+
+                def sealed(_f, result=result) -> None:
+                    result.wait_seal()
+                    st = next((x for x in result.trace.stages if x.name == "seal"), None)
+                    if st is not None:
+                        line = (f"\n{st.name:<14}{st.device:<10}{st.ops:>9}"
+                                f"{st.seconds * 1000:>11.1f}  {st.detail}")
+                        self._jobs.put(lambda: self._append_trace(line))
+
+                fut.add_done_callback(sealed)
             return "\n".join(lines)
 
         def done(trace_text: str) -> None:
